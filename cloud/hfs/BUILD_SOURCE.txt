@@ -1,0 +1,4 @@
+source_repo=https://github.com/BlueSkyXN/CloudAgent-Platform.git
+source_path=cloud/hfs
+bundle_generated_at=source-tree-placeholder
+mode=deployment-probe

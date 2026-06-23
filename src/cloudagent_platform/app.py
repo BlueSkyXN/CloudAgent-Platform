@@ -1,0 +1,3648 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import sqlite3
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.request import Request, urlopen
+
+from .admin import ADMIN_HTML
+from . import __version__
+from .runtime import CodexCliProbeAdapter, LocalPrototypeAdapter, RuntimeAdapter, RuntimeContext
+
+
+DEFAULT_TOKEN = "dev-local-token"
+DEFAULT_TENANT_ID = "tenant_local"
+DEFAULT_PROJECT_ID = "project_default"
+SCHEMA_VERSION = "2026-06-23.p0-prototype"
+DEFAULT_RETENTION = "30d"
+DEFAULT_MAX_JSON_BYTES = 1024 * 1024
+DEFAULT_MAX_STORED_CONTENT_BYTES = 1024 * 1024
+HIGH_RISK_TOOLS = {
+    "shell.exec",
+    "external.http",
+    "secret.read",
+    "deploy.publish",
+    "file.write",
+    "file.delete",
+    "integration.dify.chat",
+    "integration.feishu.message",
+}
+BUILTIN_TOOLS = [
+    {
+        "name": "artifact.create",
+        "source": "platform",
+        "description": "Create a session artifact from tool arguments.",
+        "default_policy": "always_allow",
+        "schema": {
+            "type": "object",
+            "required": ["name", "content"],
+            "properties": {"name": {"type": "string"}, "content": {"type": "string"}},
+        },
+    },
+    {
+        "name": "file.read",
+        "source": "platform",
+        "description": "Read metadata or content for an uploaded file.",
+        "default_policy": "always_allow",
+        "schema": {"type": "object", "properties": {"file_id": {"type": "string"}}},
+    },
+    {
+        "name": "external.http",
+        "source": "platform",
+        "description": "Placeholder for outbound HTTP calls; requires approval in P0.",
+        "default_policy": "always_ask",
+        "schema": {"type": "object", "properties": {"url": {"type": "string"}, "method": {"type": "string"}}},
+    },
+    {
+        "name": "integration.dify.chat",
+        "source": "connector",
+        "description": "Send a Dify chat message through a configured Dify integration.",
+        "default_policy": "always_ask",
+        "schema": {
+            "type": "object",
+            "required": ["integration_id", "query", "user"],
+            "properties": {
+                "integration_id": {"type": "string"},
+                "query": {"type": "string"},
+                "inputs": {"type": "object"},
+                "user": {"type": "string"},
+                "response_mode": {"type": "string", "enum": ["blocking", "streaming"]},
+                "conversation_id": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "integration.feishu.message",
+        "source": "connector",
+        "description": "Send a Feishu message through a configured Feishu integration.",
+        "default_policy": "always_ask",
+        "schema": {
+            "type": "object",
+            "required": ["integration_id", "receive_id", "content"],
+            "properties": {
+                "integration_id": {"type": "string"},
+                "receive_id_type": {"type": "string"},
+                "receive_id": {"type": "string"},
+                "msg_type": {"type": "string"},
+                "content": {"oneOf": [{"type": "string"}, {"type": "object"}]},
+            },
+        },
+    },
+    {
+        "name": "shell.exec",
+        "source": "platform",
+        "description": "Placeholder for shell execution; requires approval in P0.",
+        "default_policy": "always_ask",
+        "schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+    },
+]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:20]}"
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def json_loads(value: str | None, default: Any) -> Any:
+    if not value:
+        return default
+    return json.loads(value)
+
+
+def token_ref(token: str | None) -> str | None:
+    if not token:
+        return None
+    return "sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class PayloadTooLargeError(ValueError):
+    pass
+
+
+class Store:
+    def __init__(self, path: str, max_content_bytes: int = DEFAULT_MAX_STORED_CONTENT_BYTES) -> None:
+        self.path = path
+        self.max_content_bytes = max_content_bytes
+        self.adapter: RuntimeAdapter = LocalPrototypeAdapter()
+        self.probe_adapter = CodexCliProbeAdapter()
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.init_schema()
+        self.seed_defaults()
+
+    def close(self) -> None:
+        with self._lock:
+            self.conn.close()
+
+    def init_schema(self) -> None:
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                kernel_id TEXT NOT NULL,
+                system TEXT,
+                metadata TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS environments (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                runtime_type TEXT NOT NULL,
+                resource_class TEXT NOT NULL,
+                network_policy TEXT NOT NULL,
+                filesystem_policy TEXT NOT NULL,
+                secret_policy TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                environment_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                turn_status TEXT,
+                active_turn_id TEXT,
+                last_event_id TEXT,
+                metadata TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                schema_version TEXT NOT NULL,
+                turn_id TEXT,
+                type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                audit_ref TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, sequence)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                environment_id TEXT NOT NULL,
+                trigger_type TEXT NOT NULL,
+                schedule TEXT NOT NULL,
+                status TEXT NOT NULL,
+                next_run_at TEXT,
+                last_run_at TEXT,
+                metadata TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS job_runs (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                job_id TEXT,
+                session_id TEXT NOT NULL,
+                worker_id TEXT,
+                trigger_source TEXT NOT NULL,
+                status TEXT NOT NULL,
+                lease_expires_at TEXT,
+                lease_token TEXT,
+                lease_generation INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                finished_at TEXT,
+                result TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS workers (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                capabilities TEXT NOT NULL,
+                active_run_id TEXT,
+                last_heartbeat_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                content TEXT NOT NULL,
+                retention TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                content_type TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_ref TEXT NOT NULL,
+                retention TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS tool_policies (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                tool TEXT NOT NULL,
+                proposed_args TEXT NOT NULL,
+                status TEXT NOT NULL,
+                resolved_by TEXT,
+                resolved_at TEXT,
+                resolution_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS usage_records (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                run_id TEXT,
+                worker_id TEXT,
+                token_input INTEGER NOT NULL,
+                token_output INTEGER NOT NULL,
+                tool_duration_ms INTEGER NOT NULL,
+                sandbox_cpu_ms INTEGER NOT NULL,
+                sandbox_memory_peak_mb INTEGER NOT NULL,
+                sandbox_disk_read_bytes INTEGER NOT NULL,
+                sandbox_disk_write_bytes INTEGER NOT NULL,
+                sandbox_network_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS integrations (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                name TEXT NOT NULL,
+                base_url TEXT,
+                secret_ref TEXT,
+                secret_material TEXT,
+                status TEXT NOT NULL,
+                capabilities TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """,
+        ]
+        with self._lock:
+            for statement in statements:
+                self.conn.execute(statement)
+            self.ensure_schema_columns()
+            self.conn.commit()
+
+    def ensure_schema_columns(self) -> None:
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(job_runs)").fetchall()
+        }
+        if "lease_token" not in columns:
+            self.conn.execute("ALTER TABLE job_runs ADD COLUMN lease_token TEXT")
+        if "lease_generation" not in columns:
+            self.conn.execute(
+                "ALTER TABLE job_runs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
+            )
+        integration_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(integrations)").fetchall()
+        }
+        if "secret_material" not in integration_columns:
+            self.conn.execute("ALTER TABLE integrations ADD COLUMN secret_material TEXT")
+
+    def seed_defaults(self) -> None:
+        if self.list_environments():
+            return
+        self.create_environment(
+            {
+                "name": "local-docker-deny-all",
+                "runtime_type": "docker",
+                "resource_class": {"cpu_limit": 1, "memory_mb": 512, "disk_mb": 1024},
+                "network_policy": {
+                    "mode": "deny_all",
+                    "allow_hosts": [],
+                    "deny_private_networks": True,
+                    "deny_metadata_ip": True,
+                },
+                "filesystem_policy": {
+                    "workspace_root": "/workspace",
+                    "writable_paths": ["/workspace"],
+                    "read_only_root": True,
+                    "allow_host_mounts": False,
+                    "allow_docker_socket": False,
+                },
+                "secret_policy": {
+                    "mode": "none",
+                    "allow_runtime_injection": False,
+                    "allow_model_visible_plaintext": False,
+                },
+            },
+            request_id="seed",
+        )
+
+    def audit(
+        self,
+        action: str,
+        target_type: str,
+        target_id: str,
+        request_id: str,
+        actor: str = "api",
+    ) -> str:
+        timestamp = now_iso()
+        audit_id = new_id("audit")
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO audit_log
+                (id, tenant_id, project_id, actor, action, target_type, target_id, request_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    audit_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    actor,
+                    action,
+                    target_type,
+                    target_id,
+                    request_id,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        return audit_id
+
+    def fetch_one(self, query: str, args: tuple[Any, ...]) -> sqlite3.Row | None:
+        with self._lock:
+            return self.conn.execute(query, args).fetchone()
+
+    def fetch_all(self, query: str, args: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.conn.execute(query, args).fetchall())
+
+    def list_kernels(self) -> list[dict[str, Any]]:
+        return [
+            self.kernel_provider_from_manifest(self.adapter.manifest(), active=True),
+            self.kernel_provider_from_manifest(self.probe_adapter.manifest(), active=False),
+        ]
+
+    def get_kernel(self, kernel_id: str) -> dict[str, Any]:
+        for kernel in self.list_kernels():
+            if kernel["id"] == kernel_id:
+                return kernel
+        raise KeyError(kernel_id)
+
+    def probe_kernel(self, kernel_id: str) -> dict[str, Any]:
+        if kernel_id != self.probe_adapter.kernel_id:
+            raise KeyError(kernel_id)
+        return {
+            "type": "kernel_probe",
+            "kernel_id": kernel_id,
+            "adapter_id": self.probe_adapter.adapter_id,
+            "dry_run": True,
+            "probe": self.probe_adapter.probe(),
+        }
+
+    def kernel_provider_from_manifest(self, manifest: dict[str, Any], active: bool) -> dict[str, Any]:
+        probe = manifest.get("probe") or {}
+        if active:
+            status = "degraded"
+            note = "Local prototype adapter emits normalized events; real Codex CLI execution is not attached yet."
+        else:
+            status = "available" if probe.get("available") else "unavailable"
+            note = "Probe-only Codex CLI adapter. It runs codex --version only and does not execute prompts."
+        return {
+            "id": manifest["kernel_id"],
+            "type": "kernel_provider",
+            "tenant_id": DEFAULT_TENANT_ID,
+            "project_id": DEFAULT_PROJECT_ID,
+            "adapter_type": "cli",
+            "runtime_mode": manifest["runtime_mode"],
+            "adapter_id": manifest["adapter_id"],
+            "capabilities": manifest["capabilities"],
+            "constraints": manifest["constraints"],
+            "status": status,
+            "active": active,
+            "probe": probe or None,
+            "note": note,
+        }
+
+    def create_agent(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        if not payload.get("name"):
+            raise ValueError("name is required")
+        timestamp = now_iso()
+        agent_id = new_id("agent")
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO agents
+                (id, tenant_id, project_id, name, description, kernel_id, system, metadata,
+                 version, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    payload["name"],
+                    payload.get("description", ""),
+                    payload.get("kernel", {}).get("id", "codex-cli-local"),
+                    payload.get("system", ""),
+                    json_dumps(payload.get("metadata", {})),
+                    1,
+                    "active",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("agent.create", "agent", agent_id, request_id)
+        return self.get_agent(agent_id)
+
+    def list_agents(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all("SELECT * FROM agents WHERE archived_at IS NULL ORDER BY created_at DESC")
+        return [self.agent_from_row(row) for row in rows]
+
+    def get_agent(self, agent_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM agents WHERE id = ?", (agent_id,))
+        if row is None:
+            raise KeyError(agent_id)
+        return self.agent_from_row(row)
+
+    def agent_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "agent",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "name": row["name"],
+            "description": row["description"],
+            "kernel": {"id": row["kernel_id"]},
+            "system": row["system"],
+            "metadata": json_loads(row["metadata"], {}),
+            "version": row["version"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "archived_at": row["archived_at"],
+        }
+
+    def create_environment(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        if not payload.get("name"):
+            raise ValueError("name is required")
+        timestamp = now_iso()
+        env_id = new_id("env")
+        resource_class = payload.get(
+            "resource_class", {"cpu_limit": 1, "memory_mb": 512, "disk_mb": 1024}
+        )
+        network_policy = payload.get(
+            "network_policy",
+            {
+                "mode": "deny_all",
+                "allow_hosts": [],
+                "deny_private_networks": True,
+                "deny_metadata_ip": True,
+            },
+        )
+        filesystem_policy = payload.get(
+            "filesystem_policy",
+            {
+                "workspace_root": "/workspace",
+                "writable_paths": ["/workspace"],
+                "read_only_root": True,
+                "allow_host_mounts": False,
+                "allow_docker_socket": False,
+            },
+        )
+        secret_policy = payload.get(
+            "secret_policy",
+            {
+                "mode": "none",
+                "allow_runtime_injection": False,
+                "allow_model_visible_plaintext": False,
+            },
+        )
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO environments
+                (id, tenant_id, project_id, name, runtime_type, resource_class, network_policy,
+                 filesystem_policy, secret_policy, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    env_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    payload["name"],
+                    payload.get("runtime_type", "docker"),
+                    json_dumps(resource_class),
+                    json_dumps(network_policy),
+                    json_dumps(filesystem_policy),
+                    json_dumps(secret_policy),
+                    "active",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("environment.create", "environment", env_id, request_id)
+        return self.get_environment(env_id)
+
+    def list_environments(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all(
+            "SELECT * FROM environments WHERE archived_at IS NULL ORDER BY created_at DESC"
+        )
+        return [self.environment_from_row(row) for row in rows]
+
+    def get_environment(self, environment_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM environments WHERE id = ?", (environment_id,))
+        if row is None:
+            raise KeyError(environment_id)
+        return self.environment_from_row(row)
+
+    def environment_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "environment",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "name": row["name"],
+            "runtime_type": row["runtime_type"],
+            "resource_class": json_loads(row["resource_class"], {}),
+            "network_policy": json_loads(row["network_policy"], {}),
+            "filesystem_policy": json_loads(row["filesystem_policy"], {}),
+            "secret_policy": json_loads(row["secret_policy"], {}),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "archived_at": row["archived_at"],
+        }
+
+    def create_session(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        agent_id = payload.get("agent", {}).get("id") or payload.get("agent_id")
+        environment_id = payload.get("environment", {}).get("id") or payload.get("environment_id")
+        if not agent_id:
+            agents = self.list_agents()
+            if not agents:
+                raise ValueError("agent is required")
+            agent_id = agents[0]["id"]
+        if not environment_id:
+            environments = self.list_environments()
+            if not environments:
+                raise ValueError("environment is required")
+            environment_id = environments[0]["id"]
+
+        self.get_agent(agent_id)
+        self.get_environment(environment_id)
+        timestamp = now_iso()
+        session_id = new_id("sess")
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO sessions
+                (id, tenant_id, project_id, agent_id, environment_id, status, turn_status,
+                 metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    agent_id,
+                    environment_id,
+                    "idle",
+                    "idle",
+                    json_dumps(payload.get("metadata", {})),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.append_event(
+            session_id,
+            "session.created",
+            {"agent_id": agent_id, "environment_id": environment_id},
+            request_id,
+        )
+        self.audit("session.create", "session", session_id, request_id)
+        return self.get_session(session_id)
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all(
+            "SELECT * FROM sessions WHERE archived_at IS NULL ORDER BY created_at DESC"
+        )
+        return [self.session_from_row(row) for row in rows]
+
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        if row is None:
+            raise KeyError(session_id)
+        return self.session_from_row(row)
+
+    def session_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "session",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "agent_snapshot": {"id": row["agent_id"]},
+            "environment_snapshot": {"id": row["environment_id"]},
+            "kernel_id": "codex-cli-local",
+            "status": row["status"],
+            "turn_status": row["turn_status"],
+            "active_turn_id": row["active_turn_id"],
+            "last_event_id": row["last_event_id"],
+            "metadata": json_loads(row["metadata"], {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "archived_at": row["archived_at"],
+        }
+
+    def append_event(
+        self,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        request_id: str,
+        severity: str = "info",
+        turn_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_session(session_id)
+        timestamp = now_iso()
+        event_id = new_id("evt")
+        audit_ref = self.audit("event.append", "event", event_id, request_id)
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM events WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            sequence = int(row["max_sequence"]) + 1
+            self.conn.execute(
+                """
+                INSERT INTO events
+                (id, tenant_id, project_id, session_id, sequence, schema_version,
+                 turn_id, type, severity, payload, audit_ref, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    session_id,
+                    sequence,
+                    SCHEMA_VERSION,
+                    turn_id,
+                    event_type,
+                    severity,
+                    json_dumps(payload),
+                    audit_ref,
+                    timestamp,
+                ),
+            )
+            self.conn.execute(
+                """
+                UPDATE sessions SET last_event_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (event_id, timestamp, session_id),
+            )
+            self.conn.commit()
+        return self.event_from_row(self.fetch_one("SELECT * FROM events WHERE id = ?", (event_id,)))
+
+    def list_events(self, session_id: str, after_id: str | None = None) -> list[dict[str, Any]]:
+        self.get_session(session_id)
+        if after_id:
+            after = self.fetch_one(
+                "SELECT sequence FROM events WHERE session_id = ? AND id = ?",
+                (session_id, after_id),
+            )
+            if after is None:
+                sequence = 0
+            else:
+                sequence = int(after["sequence"])
+            rows = self.fetch_all(
+                "SELECT * FROM events WHERE session_id = ? AND sequence > ? ORDER BY sequence",
+                (session_id, sequence),
+            )
+        else:
+            rows = self.fetch_all(
+                "SELECT * FROM events WHERE session_id = ? ORDER BY sequence",
+                (session_id,),
+            )
+        return [self.event_from_row(row) for row in rows]
+
+    def event_from_row(self, row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            raise KeyError("event")
+        return {
+            "id": row["id"],
+            "sequence": row["sequence"],
+            "schema_version": row["schema_version"],
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "session_id": row["session_id"],
+            "turn_id": row["turn_id"],
+            "type": row["type"],
+            "severity": row["severity"],
+            "payload": json_loads(row["payload"], {}),
+            "audit_ref": row["audit_ref"],
+            "created_at": row["created_at"],
+        }
+
+    def create_file(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        name = payload.get("name")
+        if not name:
+            raise ValueError("name is required")
+        content = str(payload.get("content", ""))
+        content_type = payload.get("content_type", "text/plain; charset=utf-8")
+        raw = content.encode("utf-8")
+        if len(raw) > self.max_content_bytes:
+            raise PayloadTooLargeError("file content is too large")
+        checksum = "sha256:" + hashlib.sha256(raw).hexdigest()
+        file_id = new_id("file")
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO files
+                (id, tenant_id, project_id, name, size, content_type, checksum, content, retention, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    name,
+                    len(raw),
+                    content_type,
+                    checksum,
+                    content,
+                    payload.get("retention", DEFAULT_RETENTION),
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("file.create", "file", file_id, request_id)
+        return self.get_file(file_id)
+
+    def list_files(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all("SELECT * FROM files ORDER BY created_at DESC")
+        return [self.file_from_row(row) for row in rows]
+
+    def get_file(self, file_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM files WHERE id = ?", (file_id,))
+        if row is None:
+            raise KeyError(file_id)
+        return self.file_from_row(row)
+
+    def get_file_content(self, file_id: str) -> tuple[bytes, str]:
+        row = self.fetch_one("SELECT content, content_type FROM files WHERE id = ?", (file_id,))
+        if row is None:
+            raise KeyError(file_id)
+        return str(row["content"]).encode("utf-8"), row["content_type"]
+
+    def file_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "file",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "name": row["name"],
+            "size": row["size"],
+            "content_type": row["content_type"],
+            "checksum": row["checksum"],
+            "retention": row["retention"],
+            "created_at": row["created_at"],
+        }
+
+    def create_artifact(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+        turn_id: str | None = None,
+        emit_event: bool = True,
+    ) -> dict[str, Any]:
+        self.get_session(session_id)
+        name = payload.get("name") or "artifact.txt"
+        content = str(payload.get("content", ""))
+        content_type = payload.get("content_type", "text/plain; charset=utf-8")
+        raw = content.encode("utf-8")
+        if len(raw) > self.max_content_bytes:
+            raise PayloadTooLargeError("artifact content is too large")
+        checksum = "sha256:" + hashlib.sha256(raw).hexdigest()
+        artifact_id = new_id("art")
+        timestamp = now_iso()
+        content_ref = f"sqlite://artifacts/{artifact_id}/content"
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO artifacts
+                (id, tenant_id, project_id, session_id, turn_id, name, size, content_type,
+                 checksum, content, content_ref, retention, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    session_id,
+                    turn_id,
+                    name,
+                    len(raw),
+                    content_type,
+                    checksum,
+                    content,
+                    content_ref,
+                    payload.get("retention", DEFAULT_RETENTION),
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("artifact.create", "artifact", artifact_id, request_id)
+        artifact = self.get_artifact(artifact_id)
+        if emit_event:
+            self.append_event(
+                session_id,
+                "artifact.created",
+                {
+                    "artifact_id": artifact_id,
+                    "name": artifact["name"],
+                    "size": artifact["size"],
+                    "content_ref": artifact["content_ref"],
+                },
+                request_id,
+                turn_id=turn_id,
+            )
+        return artifact
+
+    def list_artifacts(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        if session_id:
+            self.get_session(session_id)
+            rows = self.fetch_all(
+                "SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at DESC",
+                (session_id,),
+            )
+        else:
+            rows = self.fetch_all("SELECT * FROM artifacts ORDER BY created_at DESC")
+        return [self.artifact_from_row(row) for row in rows]
+
+    def get_artifact(self, artifact_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
+        if row is None:
+            raise KeyError(artifact_id)
+        return self.artifact_from_row(row)
+
+    def artifact_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "artifact",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "session_id": row["session_id"],
+            "turn_id": row["turn_id"],
+            "name": row["name"],
+            "size": row["size"],
+            "content_type": row["content_type"],
+            "checksum": row["checksum"],
+            "content_ref": row["content_ref"],
+            "retention": row["retention"],
+            "created_at": row["created_at"],
+        }
+
+    def record_usage(
+        self,
+        session_id: str,
+        turn_id: str | None,
+        request_id: str,
+        run_id: str | None = None,
+        worker_id: str | None = None,
+        token_input: int = 0,
+        token_output: int = 0,
+        tool_duration_ms: int = 0,
+        sandbox_cpu_ms: int = 0,
+        sandbox_memory_peak_mb: int = 0,
+        sandbox_disk_read_bytes: int = 0,
+        sandbox_disk_write_bytes: int = 0,
+        sandbox_network_bytes: int = 0,
+    ) -> dict[str, Any]:
+        usage_id = new_id("usage")
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO usage_records
+                (id, tenant_id, project_id, session_id, turn_id, run_id, worker_id,
+                 token_input, token_output, tool_duration_ms, sandbox_cpu_ms,
+                 sandbox_memory_peak_mb, sandbox_disk_read_bytes, sandbox_disk_write_bytes,
+                 sandbox_network_bytes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    usage_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    session_id,
+                    turn_id,
+                    run_id,
+                    worker_id,
+                    token_input,
+                    token_output,
+                    tool_duration_ms,
+                    sandbox_cpu_ms,
+                    sandbox_memory_peak_mb,
+                    sandbox_disk_read_bytes,
+                    sandbox_disk_write_bytes,
+                    sandbox_network_bytes,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("usage.record", "usage", usage_id, request_id)
+        usage = self.get_usage_record(usage_id)
+        self.append_event(
+            session_id,
+            "usage.turn_summary",
+            {"usage_id": usage_id, "token_input": token_input, "token_output": token_output},
+            request_id,
+            turn_id=turn_id,
+        )
+        return usage
+
+    def list_usage(self, session_id: str) -> list[dict[str, Any]]:
+        self.get_session(session_id)
+        rows = self.fetch_all(
+            "SELECT * FROM usage_records WHERE session_id = ? ORDER BY created_at DESC",
+            (session_id,),
+        )
+        return [self.usage_from_row(row) for row in rows]
+
+    def get_usage_record(self, usage_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM usage_records WHERE id = ?", (usage_id,))
+        if row is None:
+            raise KeyError(usage_id)
+        return self.usage_from_row(row)
+
+    def usage_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "session_id": row["session_id"],
+            "turn_id": row["turn_id"],
+            "run_id": row["run_id"],
+            "worker_id": row["worker_id"],
+            "token_input": row["token_input"],
+            "token_output": row["token_output"],
+            "tool_duration_ms": row["tool_duration_ms"],
+            "sandbox_cpu_ms": row["sandbox_cpu_ms"],
+            "sandbox_memory_peak_mb": row["sandbox_memory_peak_mb"],
+            "sandbox_disk_read_bytes": row["sandbox_disk_read_bytes"],
+            "sandbox_disk_write_bytes": row["sandbox_disk_write_bytes"],
+            "sandbox_network_bytes": row["sandbox_network_bytes"],
+            "created_at": row["created_at"],
+        }
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        return [{"id": tool["name"], **dict(tool)} for tool in BUILTIN_TOOLS]
+
+    def create_tool_policy(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        scope = payload.get("scope")
+        mode = payload.get("mode")
+        if not scope:
+            raise ValueError("scope is required")
+        if mode not in {"always_allow", "always_ask", "always_deny"}:
+            raise ValueError("mode must be always_allow, always_ask, or always_deny")
+        policy_id = new_id("pol")
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO tool_policies
+                (id, tenant_id, project_id, scope, mode, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    policy_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    scope,
+                    mode,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("tool_policy.create", "tool_policy", policy_id, request_id)
+        return self.get_tool_policy(policy_id)
+
+    def list_tool_policies(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all("SELECT * FROM tool_policies ORDER BY created_at DESC")
+        return [self.tool_policy_from_row(row) for row in rows]
+
+    def get_tool_policy(self, policy_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM tool_policies WHERE id = ?", (policy_id,))
+        if row is None:
+            raise KeyError(policy_id)
+        return self.tool_policy_from_row(row)
+
+    def tool_policy_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "scope": row["scope"],
+            "mode": row["mode"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def resolve_tool_policy(self, tool: str) -> str:
+        row = self.fetch_one(
+            """
+            SELECT mode FROM tool_policies
+            WHERE scope = ? OR scope = '*'
+            ORDER BY CASE WHEN scope = ? THEN 0 ELSE 1 END, updated_at DESC
+            LIMIT 1
+            """,
+            (tool, tool),
+        )
+        if row:
+            return row["mode"]
+        return "always_ask" if tool in HIGH_RISK_TOOLS else "always_allow"
+
+    def request_tool(self, session_id: str, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        tool_value = payload.get("tool") or payload.get("name")
+        if isinstance(tool_value, dict):
+            tool = tool_value.get("name")
+        else:
+            tool = tool_value
+        if not tool:
+            raise ValueError("tool is required")
+        known_tools = {item["name"] for item in BUILTIN_TOOLS}
+        if tool not in known_tools:
+            raise ValueError(f"unknown tool: {tool}")
+        proposed_args = payload.get("args") or payload.get("proposed_args") or {}
+        turn_id = payload.get("turn_id") or new_id("turn")
+        requested = self.append_event(
+            session_id,
+            "tool.requested",
+            {"tool": tool, "proposed_args": proposed_args},
+            request_id,
+            turn_id=turn_id,
+        )
+        mode = self.resolve_tool_policy(tool)
+        if mode == "always_deny":
+            self.append_event(
+                session_id,
+                "policy.violation",
+                {"tool": tool, "decision": "denied"},
+                request_id,
+                severity="warning",
+                turn_id=turn_id,
+            )
+            return requested
+        if mode == "always_ask":
+            self.create_pending_action(session_id, turn_id, tool, proposed_args, request_id)
+            return requested
+        action = self.create_pending_action(
+            session_id,
+            turn_id,
+            tool,
+            proposed_args,
+            request_id,
+            status="approved",
+            resolved_by="policy",
+            reason="always_allow",
+            wait_for_approval=False,
+        )
+        self.queue_tool_action(action, request_id, source="policy")
+        return requested
+
+    def execute_tool(
+        self,
+        session_id: str,
+        turn_id: str | None,
+        tool: str,
+        args: dict[str, Any],
+        request_id: str,
+        worker_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        result: dict[str, Any]
+        if tool == "artifact.create":
+            artifact = self.create_artifact(session_id, args, request_id, turn_id=turn_id)
+            result = {"artifact_id": artifact["id"], "content_ref": artifact["content_ref"]}
+        elif tool == "file.read":
+            file_id = args.get("file_id")
+            if not file_id:
+                raise ValueError("file_id is required")
+            result = {"file": self.get_file(file_id)}
+        elif tool == "integration.dify.chat":
+            result = self.invoke_dify_chat(args)
+        elif tool == "integration.feishu.message":
+            result = self.invoke_feishu_message(args)
+        else:
+            raise ValueError(f"unsupported tool execution: {tool}")
+        duration_ms = int((time.monotonic() - started) * 1000)
+        result_payload = {"tool": tool, "result": result, "duration_ms": duration_ms}
+        if worker_id:
+            result_payload["worker_id"] = worker_id
+        if run_id:
+            result_payload["run_id"] = run_id
+        self.append_event(
+            session_id,
+            "tool.result",
+            result_payload,
+            request_id,
+            turn_id=turn_id,
+        )
+        return result
+
+    def create_pending_action(
+        self,
+        session_id: str,
+        turn_id: str | None,
+        tool: str,
+        proposed_args: dict[str, Any],
+        request_id: str,
+        status: str = "pending",
+        resolved_by: str | None = None,
+        reason: str = "",
+        wait_for_approval: bool = True,
+    ) -> dict[str, Any]:
+        if status not in {"pending", "approved", "rejected"}:
+            raise ValueError("pending action status must be pending, approved, or rejected")
+        self.get_session(session_id)
+        action_id = new_id("act")
+        timestamp = now_iso()
+        resolved_at = timestamp if status in {"approved", "rejected"} else None
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO pending_actions
+                (id, tenant_id, project_id, session_id, turn_id, tool, proposed_args,
+                 status, resolved_by, resolved_at, resolution_reason, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    action_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    session_id,
+                    turn_id,
+                    tool,
+                    json_dumps(proposed_args),
+                    status,
+                    resolved_by,
+                    resolved_at,
+                    reason,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            if wait_for_approval:
+                self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, turn_status = ?, active_turn_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("waiting_approval", "waiting_approval", turn_id, timestamp, session_id),
+                )
+            self.conn.commit()
+        self.audit("pending_action.create", "pending_action", action_id, request_id)
+        if wait_for_approval:
+            self.append_event(
+                session_id,
+                "approval.required",
+                {"action_id": action_id, "tool": tool, "proposed_args": proposed_args},
+                request_id,
+                turn_id=turn_id,
+            )
+        return self.get_pending_action(action_id)
+
+    def queue_tool_action(self, action: dict[str, Any], request_id: str, source: str) -> dict[str, Any]:
+        if action["status"] != "approved":
+            raise ValueError("tool action must be approved before it can be queued")
+        run = self.create_run(
+            action["session_id"],
+            request_id,
+            trigger_source=f"tool:{action['tool']}",
+            job_id=None,
+            assign_worker=False,
+        )
+        self.append_event(
+            action["session_id"],
+            "tool.execution_queued",
+            {
+                "action_id": action["id"],
+                "tool": action["tool"],
+                "run_id": run["id"],
+                "source": source,
+            },
+            request_id,
+            turn_id=action["turn_id"],
+        )
+        self.audit("tool.execution_enqueue", "pending_action", action["id"], request_id)
+        return {
+            "type": "tool_execution_queued",
+            "action": self.get_pending_action(action["id"]),
+            "run": self.get_run(run["id"]),
+            "session": self.get_session(action["session_id"]),
+        }
+
+    def list_pending_actions(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        if session_id:
+            self.get_session(session_id)
+            rows = self.fetch_all(
+                "SELECT * FROM pending_actions WHERE session_id = ? ORDER BY created_at DESC",
+                (session_id,),
+            )
+        else:
+            rows = self.fetch_all("SELECT * FROM pending_actions ORDER BY created_at DESC")
+        return [self.pending_action_from_row(row) for row in rows]
+
+    def get_pending_action(self, action_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM pending_actions WHERE id = ?", (action_id,))
+        if row is None:
+            raise KeyError(action_id)
+        return self.pending_action_from_row(row)
+
+    def resolve_pending_action(
+        self,
+        session_id: str,
+        action_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        action = self.get_pending_action(action_id)
+        if action["session_id"] != session_id:
+            raise KeyError(action_id)
+        if action["status"] != "pending":
+            raise ValueError("pending action is already resolved")
+        decision = payload.get("decision")
+        if decision not in {"approve", "reject"}:
+            raise ValueError("decision must be approve or reject")
+        status = "approved" if decision == "approve" else "rejected"
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE pending_actions
+                SET status = ?, resolved_by = ?, resolved_at = ?, resolution_reason = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    payload.get("resolved_by", "api"),
+                    timestamp,
+                    payload.get("reason", ""),
+                    timestamp,
+                    action_id,
+                ),
+            )
+            self.conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                ("idle", "idle", timestamp, session_id),
+            )
+            self.conn.commit()
+        self.audit("pending_action.resolve", "pending_action", action_id, request_id)
+        self.append_event(
+            session_id,
+            "approval.resolved",
+            {"action_id": action_id, "decision": decision, "reason": payload.get("reason", "")},
+            request_id,
+            turn_id=action["turn_id"],
+        )
+        if decision == "approve":
+            self.queue_tool_action(self.get_pending_action(action_id), request_id, source="approval")
+        else:
+            self.append_event(
+                session_id,
+                "tool.result",
+                {"tool": action["tool"], "result": {"status": "rejected"}},
+                request_id,
+                turn_id=action["turn_id"],
+            )
+        return self.get_pending_action(action_id)
+
+    def pending_action_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "session_id": row["session_id"],
+            "turn_id": row["turn_id"],
+            "tool": row["tool"],
+            "proposed_args": json_loads(row["proposed_args"], {}),
+            "status": row["status"],
+            "resolved_by": row["resolved_by"],
+            "resolved_at": row["resolved_at"],
+            "reason": row["resolution_reason"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def run_adapter_turn(
+        self,
+        session_id: str,
+        source: str,
+        request_id: str,
+        run_id: str | None = None,
+        worker_id: str | None = None,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        turn_id = new_id("turn")
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, turn_status = ?, active_turn_id = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("running", "running", turn_id, timestamp, session_id),
+            )
+            self.conn.commit()
+        self.append_event(
+            session_id,
+            "session.running",
+            {"source": source, "turn_id": turn_id, "run_id": run_id, "worker_id": worker_id},
+            request_id,
+            turn_id=turn_id,
+        )
+        adapter_result = self.adapter.execute_turn(
+            self,
+            RuntimeContext(
+                session_id=session_id,
+                turn_id=turn_id,
+                source=source,
+                request_id=request_id,
+                adapter_id=self.adapter.adapter_id,
+                kernel_id=self.adapter.kernel_id,
+                run_id=run_id,
+                worker_id=worker_id,
+            ),
+        )
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                ("idle", "idle", timestamp, session_id),
+            )
+            self.conn.commit()
+        self.append_event(session_id, "session.idle", {"turn_id": turn_id}, request_id, turn_id=turn_id)
+        return {"turn_id": turn_id, "adapter": adapter_result}
+
+    def run_noop_turn(self, session_id: str, source: str, request_id: str) -> None:
+        self.run_adapter_turn(session_id, source, request_id)
+
+    def enqueue_session_turn(
+        self,
+        session_id: str,
+        triggering_event: dict[str, Any],
+        request_id: str,
+        source: str = "api",
+    ) -> dict[str, Any]:
+        if triggering_event.get("session_id") != session_id:
+            raise ValueError("triggering event does not belong to session")
+        event_type = triggering_event["type"]
+        run = self.create_run(
+            session_id,
+            request_id,
+            trigger_source=f"session:{event_type}",
+            job_id=None,
+            assign_worker=False,
+        )
+        self.append_event(
+            session_id,
+            "session.turn_queued",
+            {
+                "event_id": triggering_event["id"],
+                "event_type": event_type,
+                "run_id": run["id"],
+                "source": source,
+            },
+            request_id,
+        )
+        self.audit("session.turn_enqueue", "session", session_id, request_id)
+        return {
+            "type": "session_turn_queued",
+            "event": triggering_event,
+            "run": self.get_run(run["id"]),
+            "session": self.get_session(session_id),
+        }
+
+    def create_job(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        if not payload.get("name"):
+            raise ValueError("name is required")
+        agent_id = payload.get("agent_id")
+        environment_id = payload.get("environment_id")
+        if not agent_id:
+            agents = self.list_agents()
+            if not agents:
+                raise ValueError("agent_id is required")
+            agent_id = agents[0]["id"]
+        if not environment_id:
+            environments = self.list_environments()
+            if not environments:
+                raise ValueError("environment_id is required")
+            environment_id = environments[0]["id"]
+        self.get_agent(agent_id)
+        self.get_environment(environment_id)
+
+        trigger = payload.get("trigger", {"type": "manual"})
+        trigger_type = trigger.get("type", "manual")
+        next_run_at = None
+        if trigger_type == "delay":
+            delay_seconds = int(trigger.get("delay_seconds", 0))
+            next_run_at = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
+        timestamp = now_iso()
+        job_id = new_id("job")
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO jobs
+                (id, tenant_id, project_id, name, agent_id, environment_id, trigger_type,
+                 schedule, status, next_run_at, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    payload["name"],
+                    agent_id,
+                    environment_id,
+                    trigger_type,
+                    json_dumps(trigger),
+                    "active",
+                    next_run_at,
+                    json_dumps(payload.get("metadata", {})),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("job.create", "job", job_id, request_id)
+        return self.get_job(job_id)
+
+    def register_worker(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        worker_id = payload.get("id") or new_id("worker")
+        capabilities = payload.get(
+            "capabilities",
+            {
+                "local_noop_turn": True,
+                "session_events": True,
+                "integration_webhooks": True,
+            },
+        )
+        with self._lock:
+            existing = self.conn.execute(
+                "SELECT id FROM workers WHERE id = ?", (worker_id,)
+            ).fetchone()
+            if existing:
+                self.conn.execute(
+                    """
+                    UPDATE workers
+                    SET name = ?, status = ?, capabilities = ?, last_heartbeat_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        payload.get("name", worker_id),
+                        payload.get("status", "active"),
+                        json_dumps(capabilities),
+                        timestamp,
+                        timestamp,
+                        worker_id,
+                    ),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    INSERT INTO workers
+                    (id, tenant_id, project_id, name, status, capabilities,
+                     last_heartbeat_at, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        worker_id,
+                        DEFAULT_TENANT_ID,
+                        DEFAULT_PROJECT_ID,
+                        payload.get("name", worker_id),
+                        payload.get("status", "active"),
+                        json_dumps(capabilities),
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            self.conn.commit()
+        self.audit("worker.register", "worker", worker_id, request_id)
+        return self.get_worker(worker_id)
+
+    def heartbeat_worker(self, worker_id: str, request_id: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self._lock:
+            updated = self.conn.execute(
+                """
+                UPDATE workers
+                SET status = 'active', last_heartbeat_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, worker_id),
+            ).rowcount
+            self.conn.commit()
+        if not updated:
+            raise KeyError(worker_id)
+        self.audit("worker.heartbeat", "worker", worker_id, request_id)
+        return self.get_worker(worker_id)
+
+    def list_workers(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all("SELECT * FROM workers ORDER BY updated_at DESC")
+        return [self.worker_from_row(row) for row in rows]
+
+    def get_worker(self, worker_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM workers WHERE id = ?", (worker_id,))
+        if row is None:
+            raise KeyError(worker_id)
+        return self.worker_from_row(row)
+
+    def worker_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "worker",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "name": row["name"],
+            "status": row["status"],
+            "capabilities": json_loads(row["capabilities"], {}),
+            "active_run_id": row["active_run_id"],
+            "last_heartbeat_at": row["last_heartbeat_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def select_worker(self) -> dict[str, Any] | None:
+        row = self.fetch_one(
+            """
+            SELECT * FROM workers
+            WHERE status = 'active'
+              AND active_run_id IS NULL
+            ORDER BY last_heartbeat_at DESC
+            LIMIT 1
+            """,
+            (),
+        )
+        return self.worker_from_row(row) if row else None
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all("SELECT * FROM jobs ORDER BY created_at DESC")
+        return [self.job_from_row(row) for row in rows]
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        if row is None:
+            raise KeyError(job_id)
+        return self.job_from_row(row)
+
+    def create_run(
+        self,
+        session_id: str,
+        request_id: str,
+        trigger_source: str,
+        job_id: str | None = None,
+        assign_worker: bool = False,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        run_id = new_id("run")
+        worker_id = None
+        status = "queued"
+        lease_expires_at = None
+        lease_token = None
+        lease_generation = 0
+        with self._lock:
+            if assign_worker:
+                worker_row = self.conn.execute(
+                    """
+                    SELECT * FROM workers
+                    WHERE status = 'active'
+                      AND active_run_id IS NULL
+                    ORDER BY last_heartbeat_at DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if worker_row:
+                    worker_id = worker_row["id"]
+                    status = "running"
+                    lease_expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+                    lease_token = new_id("lease")
+                    lease_generation = 1
+            self.conn.execute(
+                """
+                INSERT INTO job_runs
+                (id, tenant_id, project_id, job_id, session_id, worker_id, trigger_source,
+                 status, lease_expires_at, lease_token, lease_generation, result, created_at, updated_at, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    job_id,
+                    session_id,
+                    worker_id,
+                    trigger_source,
+                    status,
+                    lease_expires_at,
+                    lease_token,
+                    lease_generation,
+                    json_dumps({}),
+                    timestamp,
+                    timestamp,
+                    timestamp if worker_id else None,
+                ),
+            )
+            if worker_id:
+                updated_worker = self.conn.execute(
+                    """
+                    UPDATE workers
+                    SET active_run_id = ?, updated_at = ?
+                    WHERE id = ? AND active_run_id IS NULL
+                    """,
+                    (run_id, timestamp, worker_id),
+                ).rowcount
+                if updated_worker != 1:
+                    worker_id = None
+                    status = "queued"
+                    lease_expires_at = None
+                    lease_token = None
+                    lease_generation = 0
+                    self.conn.execute(
+                        """
+                        UPDATE job_runs
+                        SET status = 'queued',
+                            worker_id = NULL,
+                            lease_expires_at = NULL,
+                            lease_token = NULL,
+                            lease_generation = 0,
+                            started_at = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (timestamp, run_id),
+                    )
+            if not worker_id:
+                self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, turn_status = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("queued", "queued", timestamp, session_id),
+                )
+            self.conn.commit()
+        self.audit("run.create", "run", run_id, request_id)
+        run = self.get_run(run_id)
+        self.append_event(
+            session_id,
+            "run.queued" if not worker_id else "run.assigned",
+            {
+                "run_id": run_id,
+                "job_id": job_id,
+                "trigger_source": trigger_source,
+                "worker_id": worker_id,
+                "lease_expires_at": lease_expires_at,
+                "lease_generation": lease_generation,
+            },
+            request_id,
+        )
+        return run
+
+    def claim_next_run(
+        self,
+        worker_id: str,
+        request_id: str,
+        lease_seconds: int = 900,
+    ) -> dict[str, Any]:
+        if lease_seconds <= 0 or lease_seconds > 86400:
+            raise ValueError("lease_seconds must be between 1 and 86400")
+        worker = self.get_worker(worker_id)
+        if worker.get("active_run_id"):
+            raise ValueError("worker already has an active run")
+        timestamp = now_iso()
+        lease_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        lease_token = new_id("lease")
+        with self._lock:
+            worker_row = self.conn.execute(
+                "SELECT * FROM workers WHERE id = ?", (worker_id,)
+            ).fetchone()
+            if worker_row is None:
+                raise KeyError(worker_id)
+            if worker_row["active_run_id"]:
+                raise ValueError("worker already has an active run")
+            row = self.conn.execute(
+                """
+                SELECT * FROM job_runs
+                WHERE status = 'queued'
+                ORDER BY created_at
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                self.conn.execute(
+                    """
+                    UPDATE workers
+                    SET status = 'active', last_heartbeat_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (timestamp, timestamp, worker_id),
+                )
+                self.conn.commit()
+                self.audit("worker.claim.empty", "worker", worker_id, request_id)
+                return {"type": "worker_claim", "worker": self.get_worker(worker_id), "run": None}
+            run_id = row["id"]
+            updated = self.conn.execute(
+                """
+                UPDATE job_runs
+                SET status = 'running',
+                    worker_id = ?,
+                    lease_expires_at = ?,
+                    lease_token = ?,
+                    lease_generation = lease_generation + 1,
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE id = ? AND status = 'queued'
+                """,
+                (worker_id, lease_expires_at, lease_token, timestamp, timestamp, run_id),
+            ).rowcount
+            if updated != 1:
+                self.conn.commit()
+                raise ValueError("queued run could not be claimed")
+            worker_updated = self.conn.execute(
+                """
+                UPDATE workers
+                SET status = 'active', active_run_id = ?, last_heartbeat_at = ?, updated_at = ?
+                WHERE id = ? AND active_run_id IS NULL
+                """,
+                (run_id, timestamp, timestamp, worker_id),
+            ).rowcount
+            if worker_updated != 1:
+                self.conn.rollback()
+                raise ValueError("worker already has an active run")
+            self.conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, turn_status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ("starting", "starting", timestamp, row["session_id"]),
+            )
+            self.conn.commit()
+        self.audit("worker.claim", "run", run_id, request_id)
+        self.append_event(
+            row["session_id"],
+            "worker.claimed",
+            {
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "lease_expires_at": lease_expires_at,
+            },
+            request_id,
+        )
+        return {
+            "type": "worker_claim",
+            "worker": self.get_worker(worker_id),
+            "run": self.get_run(run_id, include_lease_token=True),
+        }
+
+    def execute_claimed_run(
+        self,
+        worker_id: str,
+        run_id: str,
+        lease_token: str | None,
+        request_id: str,
+    ) -> dict[str, Any]:
+        run = self.validate_worker_run(worker_id, run_id, lease_token)
+        adapter_result = self.run_adapter_turn(
+            run["session_id"],
+            source=run["trigger_source"],
+            request_id=request_id,
+            run_id=run_id,
+            worker_id=worker_id,
+        )
+        adapter_status = adapter_result["adapter"].get("status")
+        final_status = "succeeded" if adapter_status == "succeeded" else "failed"
+        completed = self.complete_run(
+            run_id,
+            final_status,
+            {
+                "session_id": run["session_id"],
+                "completed_by": worker_id,
+                "adapter": adapter_result["adapter"],
+            },
+            request_id,
+            worker_id=worker_id,
+            lease_token=lease_token,
+        )
+        return {"type": "worker_run_execution", "run": completed, "adapter": adapter_result["adapter"]}
+
+    def validate_worker_run(self, worker_id: str, run_id: str, lease_token: str | None) -> dict[str, Any]:
+        run = self.get_run(run_id, include_lease_token=True)
+        if run["worker_id"] != worker_id:
+            raise PermissionError("run is not assigned to this worker")
+        if run["status"] != "running":
+            raise ValueError("run must be running")
+        if not lease_token or not isinstance(lease_token, str):
+            raise PermissionError("lease_token is required")
+        current_token = run.get("lease_token")
+        if not current_token or not hmac.compare_digest(current_token, lease_token):
+            raise PermissionError("invalid run lease token")
+        if run.get("lease_expires_at") and parse_iso(run["lease_expires_at"]) <= datetime.now(timezone.utc):
+            raise PermissionError("run lease is expired")
+        return run
+
+    def start_worker_run_turn(
+        self,
+        worker_id: str,
+        run_id: str,
+        lease_token: str | None,
+        request_id: str,
+    ) -> dict[str, Any]:
+        run = self.validate_worker_run(worker_id, run_id, lease_token)
+        session = self.get_session(run["session_id"])
+        if session.get("active_turn_id"):
+            raise ValueError("session already has an active turn")
+        timestamp = now_iso()
+        turn_id = new_id("turn")
+        with self._lock:
+            updated = self.conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, turn_status = ?, active_turn_id = ?, updated_at = ?
+                WHERE id = ? AND active_turn_id IS NULL
+                """,
+                ("running", "running", turn_id, timestamp, run["session_id"]),
+            ).rowcount
+            self.conn.commit()
+        if updated != 1:
+            raise ValueError("session already has an active turn")
+        self.append_event(
+            run["session_id"],
+            "session.running",
+            {"source": run["trigger_source"], "turn_id": turn_id, "run_id": run_id, "worker_id": worker_id},
+            request_id,
+            turn_id=turn_id,
+        )
+        return {
+            "type": "worker_turn_start",
+            "turn_id": turn_id,
+            "run": self.get_run(run_id),
+            "session": self.get_session(run["session_id"]),
+            "adapter": self.adapter.manifest(),
+        }
+
+    def renew_worker_run_lease(
+        self,
+        worker_id: str,
+        run_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        lease_seconds = int(payload.get("lease_seconds", 900))
+        if lease_seconds <= 0 or lease_seconds > 86400:
+            raise ValueError("lease_seconds must be between 1 and 86400")
+        run = self.validate_worker_run(worker_id, run_id, payload.get("lease_token"))
+        timestamp = now_iso()
+        lease_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock:
+            updated = self.conn.execute(
+                """
+                UPDATE job_runs
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE id = ?
+                  AND status = 'running'
+                  AND worker_id = ?
+                  AND lease_token = ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                """,
+                (lease_expires_at, timestamp, run_id, worker_id, payload.get("lease_token"), timestamp),
+            ).rowcount
+            if updated != 1:
+                self.conn.rollback()
+                raise PermissionError("run lease is no longer current")
+            self.conn.execute(
+                """
+                UPDATE workers
+                SET status = 'active', last_heartbeat_at = ?, updated_at = ?
+                WHERE id = ? AND active_run_id = ?
+                """,
+                (timestamp, timestamp, worker_id, run_id),
+            )
+            self.conn.commit()
+        self.audit("worker.lease_renew", "run", run_id, request_id)
+        self.append_event(
+            run["session_id"],
+            "worker.lease_renewed",
+            {
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "lease_expires_at": lease_expires_at,
+                "lease_generation": run["lease_generation"],
+            },
+            request_id,
+        )
+        return {
+            "type": "worker_lease_renewal",
+            "run": self.get_run(run_id, include_lease_token=True),
+            "worker": self.get_worker(worker_id),
+        }
+
+    def append_worker_run_event(
+        self,
+        worker_id: str,
+        run_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        run = self.validate_worker_run(worker_id, run_id, payload.get("lease_token"))
+        event_type = payload.get("type") or payload.get("event_type")
+        if not event_type:
+            raise ValueError("event type is required")
+        event_payload = payload.get("payload", {})
+        if not isinstance(event_payload, dict):
+            raise ValueError("event payload must be an object")
+        turn_id = payload.get("turn_id") or self.get_session(run["session_id"]).get("active_turn_id")
+        severity = payload.get("severity", "info")
+        return self.append_event(
+            run["session_id"],
+            event_type,
+            event_payload,
+            request_id,
+            severity=severity,
+            turn_id=turn_id,
+        )
+
+    def create_worker_run_artifact(
+        self,
+        worker_id: str,
+        run_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        run = self.validate_worker_run(worker_id, run_id, payload.get("lease_token"))
+        artifact_payload = payload.get("artifact", payload)
+        if not isinstance(artifact_payload, dict):
+            raise ValueError("artifact payload must be an object")
+        artifact_payload = dict(artifact_payload)
+        turn_id = payload.get("turn_id") or artifact_payload.pop("turn_id", None)
+        emit_event = bool(payload.get("emit_event", artifact_payload.pop("emit_event", True)))
+        return self.create_artifact(
+            run["session_id"],
+            artifact_payload,
+            request_id,
+            turn_id=turn_id,
+            emit_event=emit_event,
+        )
+
+    def record_worker_run_usage(
+        self,
+        worker_id: str,
+        run_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        run = self.validate_worker_run(worker_id, run_id, payload.get("lease_token"))
+        return self.record_usage(
+            run["session_id"],
+            payload.get("turn_id"),
+            request_id,
+            run_id=run_id,
+            worker_id=worker_id,
+            token_input=int(payload.get("token_input", 0)),
+            token_output=int(payload.get("token_output", 0)),
+            tool_duration_ms=int(payload.get("tool_duration_ms", 0)),
+            sandbox_cpu_ms=int(payload.get("sandbox_cpu_ms", 0)),
+            sandbox_memory_peak_mb=int(payload.get("sandbox_memory_peak_mb", 0)),
+            sandbox_disk_read_bytes=int(payload.get("sandbox_disk_read_bytes", 0)),
+            sandbox_disk_write_bytes=int(payload.get("sandbox_disk_write_bytes", 0)),
+            sandbox_network_bytes=int(payload.get("sandbox_network_bytes", 0)),
+        )
+
+    def execute_worker_run_tool(
+        self,
+        worker_id: str,
+        run_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        run = self.validate_worker_run(worker_id, run_id, payload.get("lease_token"))
+        action_id = payload.get("action_id")
+        if not action_id:
+            raise ValueError("action_id is required")
+        action = self.get_pending_action(action_id)
+        if action["session_id"] != run["session_id"]:
+            raise PermissionError("tool action does not belong to this run session")
+        if run["trigger_source"] != f"tool:{action['tool']}":
+            raise PermissionError("tool action is not assigned to this run")
+        if action["status"] != "approved":
+            raise ValueError("tool action must be approved before worker execution")
+        turn_id = payload.get("turn_id") or action["turn_id"] or self.get_session(run["session_id"]).get("active_turn_id")
+        self.append_event(
+            run["session_id"],
+            "tool.execution_started",
+            {"action_id": action_id, "tool": action["tool"], "run_id": run_id, "worker_id": worker_id},
+            request_id,
+            turn_id=turn_id,
+        )
+        result = self.execute_tool(
+            run["session_id"],
+            turn_id,
+            action["tool"],
+            action["proposed_args"],
+            request_id,
+            worker_id=worker_id,
+            run_id=run_id,
+        )
+        timestamp = now_iso()
+        with self._lock:
+            updated = self.conn.execute(
+                """
+                UPDATE pending_actions
+                SET status = ?, updated_at = ?
+                WHERE id = ? AND status = 'approved'
+                """,
+                ("executed", timestamp, action_id),
+            ).rowcount
+            self.conn.commit()
+        if updated != 1:
+            raise ValueError("tool action is no longer executable")
+        self.audit("worker.tool_execute", "pending_action", action_id, request_id)
+        self.append_event(
+            run["session_id"],
+            "tool.execution_completed",
+            {"action_id": action_id, "tool": action["tool"], "run_id": run_id, "worker_id": worker_id},
+            request_id,
+            turn_id=turn_id,
+        )
+        return {
+            "type": "worker_tool_execution",
+            "action": self.get_pending_action(action_id),
+            "run": self.get_run(run_id),
+            "result": result,
+        }
+
+    def complete_worker_run(
+        self,
+        worker_id: str,
+        run_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        lease_token = payload.get("lease_token")
+        run = self.validate_worker_run(worker_id, run_id, lease_token)
+        status = payload.get("status")
+        if status not in {"succeeded", "failed", "canceled"}:
+            raise ValueError("status must be succeeded, failed, or canceled")
+        result = payload.get("result", {})
+        if not isinstance(result, dict):
+            raise ValueError("result must be an object")
+        turn_id = payload.get("turn_id") or self.get_session(run["session_id"]).get("active_turn_id")
+        completed = self.complete_run(
+            run_id,
+            status,
+            result,
+            request_id,
+            worker_id=worker_id,
+            lease_token=lease_token,
+        )
+        if turn_id:
+            event_type = "session.idle" if status in {"succeeded", "canceled"} else "session.failed"
+            self.append_event(
+                run["session_id"],
+                event_type,
+                {"turn_id": turn_id, "run_id": run_id, "worker_id": worker_id},
+                request_id,
+                severity="error" if status == "failed" else "info",
+                turn_id=turn_id,
+            )
+        return {
+            "type": "worker_run_completion",
+            "run": completed,
+            "session": self.get_session(run["session_id"]),
+        }
+
+    def requeue_expired_runs(self, request_id: str) -> int:
+        timestamp = now_iso()
+        rows = self.fetch_all(
+            """
+            SELECT * FROM job_runs
+            WHERE status = 'running'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= ?
+            """,
+            (timestamp,),
+        )
+        requeued = 0
+        for row in rows:
+            with self._lock:
+                updated = self.conn.execute(
+                    """
+                    UPDATE job_runs
+                    SET status = 'queued',
+                        worker_id = NULL,
+                        lease_expires_at = NULL,
+                        lease_token = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'running'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
+                    """,
+                    (timestamp, row["id"], timestamp),
+                ).rowcount
+                if updated != 1:
+                    self.conn.commit()
+                    continue
+                requeued += 1
+                if row["worker_id"]:
+                    self.conn.execute(
+                        "UPDATE workers SET active_run_id = NULL, updated_at = ? WHERE id = ? AND active_run_id = ?",
+                        (timestamp, row["worker_id"], row["id"]),
+                    )
+                self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("queued", "queued", timestamp, row["session_id"]),
+                )
+                self.conn.commit()
+            self.audit("run.lease_expired", "run", row["id"], request_id)
+            self.append_event(
+                row["session_id"],
+                "worker.lease_expired",
+                {"run_id": row["id"], "worker_id": row["worker_id"]},
+                request_id,
+                severity="warning",
+            )
+        return requeued
+
+    def complete_run(
+        self,
+        run_id: str,
+        status: str,
+        result: dict[str, Any],
+        request_id: str,
+        worker_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        run = self.get_run(run_id)
+        with self._lock:
+            if worker_id is not None or lease_token is not None:
+                if not worker_id or not lease_token:
+                    raise PermissionError("worker_id and lease_token are required")
+                updated = self.conn.execute(
+                    """
+                    UPDATE job_runs
+                    SET status = ?,
+                        result = ?,
+                        finished_at = ?,
+                        lease_expires_at = NULL,
+                        lease_token = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'running'
+                      AND worker_id = ?
+                      AND lease_token = ?
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at > ?
+                    """,
+                    (status, json_dumps(result), timestamp, timestamp, run_id, worker_id, lease_token, timestamp),
+                ).rowcount
+                if updated != 1:
+                    self.conn.rollback()
+                    raise PermissionError("run lease is no longer current")
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE job_runs
+                    SET status = ?,
+                        result = ?,
+                        finished_at = ?,
+                        lease_expires_at = NULL,
+                        lease_token = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (status, json_dumps(result), timestamp, timestamp, run_id),
+                )
+            if run.get("worker_id"):
+                self.conn.execute(
+                    """
+                    UPDATE workers
+                    SET active_run_id = NULL, updated_at = ?
+                    WHERE id = ? AND active_run_id = ?
+                    """,
+                    (timestamp, run["worker_id"], run_id),
+                )
+            if status in {"succeeded", "canceled"}:
+                self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("idle", "idle", timestamp, run["session_id"]),
+                )
+            elif status == "failed":
+                self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("failed", "failed", timestamp, run["session_id"]),
+                )
+            self.conn.commit()
+        self.audit("run.complete", "run", run_id, request_id)
+        completed = self.get_run(run_id)
+        self.append_event(
+            run["session_id"],
+            "run.completed",
+            {"run_id": run_id, "status": status, "worker_id": run.get("worker_id")},
+            request_id,
+            severity="error" if status == "failed" else "info",
+        )
+        return completed
+
+    def list_runs(self, include_lease_token: bool = False) -> list[dict[str, Any]]:
+        rows = self.fetch_all("SELECT * FROM job_runs ORDER BY created_at DESC")
+        return [self.run_from_row(row, include_lease_token=include_lease_token) for row in rows]
+
+    def get_run(self, run_id: str, include_lease_token: bool = False) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM job_runs WHERE id = ?", (run_id,))
+        if row is None:
+            raise KeyError(run_id)
+        return self.run_from_row(row, include_lease_token=include_lease_token)
+
+    def run_from_row(self, row: sqlite3.Row, include_lease_token: bool = False) -> dict[str, Any]:
+        run = {
+            "id": row["id"],
+            "type": "job_run",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "job_id": row["job_id"],
+            "session_id": row["session_id"],
+            "worker_id": row["worker_id"],
+            "trigger_source": row["trigger_source"],
+            "status": row["status"],
+            "lease_expires_at": row["lease_expires_at"],
+            "lease_generation": row["lease_generation"],
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+            "result": json_loads(row["result"], {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        if include_lease_token:
+            run["lease_token"] = row["lease_token"]
+        return run
+
+    def job_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "job",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "name": row["name"],
+            "agent_id": row["agent_id"],
+            "environment_id": row["environment_id"],
+            "trigger": json_loads(row["schedule"], {}),
+            "status": row["status"],
+            "next_run_at": row["next_run_at"],
+            "last_run_at": row["last_run_at"],
+            "metadata": json_loads(row["metadata"], {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def trigger_job(self, job_id: str, request_id: str, source: str = "manual") -> dict[str, Any]:
+        job = self.get_job(job_id)
+        session = self.create_session(
+            {"agent_id": job["agent_id"], "environment_id": job["environment_id"], "metadata": {"job_id": job_id}},
+            request_id,
+        )
+        run = self.create_run(
+            session["id"],
+            request_id,
+            trigger_source=f"job:{source}",
+            job_id=job_id,
+            assign_worker=False,
+        )
+        self.append_event(
+            session["id"],
+            "job.triggered",
+            {"job_id": job_id, "run_id": run["id"], "source": source},
+            request_id,
+        )
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE jobs SET last_run_at = ?, next_run_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, job_id),
+            )
+            self.conn.commit()
+        self.audit("job.trigger", "job", job_id, request_id)
+        return {"job": self.get_job(job_id), "run": self.get_run(run["id"]), "session": self.get_session(session["id"])}
+
+    def enqueue_job(self, job_id: str, request_id: str, source: str = "manual") -> dict[str, Any]:
+        job = self.get_job(job_id)
+        session = self.create_session(
+            {"agent_id": job["agent_id"], "environment_id": job["environment_id"], "metadata": {"job_id": job_id}},
+            request_id,
+        )
+        run = self.create_run(
+            session["id"],
+            request_id,
+            trigger_source=f"job:{source}",
+            job_id=job_id,
+            assign_worker=False,
+        )
+        self.append_event(
+            session["id"],
+            "job.enqueued",
+            {"job_id": job_id, "run_id": run["id"], "source": source},
+            request_id,
+        )
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                UPDATE jobs SET last_run_at = ?, next_run_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, job_id),
+            )
+            self.conn.commit()
+        self.audit("job.enqueue", "job", job_id, request_id)
+        return {"job": self.get_job(job_id), "run": self.get_run(run["id"]), "session": self.get_session(session["id"])}
+
+    def trigger_integration_webhook(
+        self,
+        provider: str,
+        integration_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+        supplied_token: str | None,
+    ) -> dict[str, Any]:
+        integration = self.get_integration(integration_id)
+        if integration["provider"] != provider:
+            raise ValueError("webhook provider does not match integration")
+        if not integration.get("secret_ref"):
+            raise PermissionError("webhook token is not configured for integration")
+        if not hmac.compare_digest(token_ref(supplied_token) or "", integration["secret_ref"]):
+            raise PermissionError("missing or invalid webhook token")
+
+        agents = self.list_agents()
+        if not agents:
+            raise ValueError("at least one agent is required before webhook trigger")
+        environments = self.list_environments()
+        if not environments:
+            raise ValueError("at least one environment is required before webhook trigger")
+        session = self.create_session(
+            {
+                "agent_id": agents[0]["id"],
+                "environment_id": environments[0]["id"],
+                "metadata": {"integration_id": integration_id, "provider": provider},
+            },
+            request_id,
+        )
+        run = self.create_run(
+            session["id"],
+            request_id,
+            trigger_source=f"integration:{provider}",
+            job_id=None,
+        )
+        self.append_event(
+            session["id"],
+            "integration.webhook.received",
+            {
+                "integration_id": integration_id,
+                "provider": provider,
+                "run_id": run["id"],
+                "payload": payload,
+            },
+            request_id,
+        )
+        self.audit("integration.webhook", "integration", integration_id, request_id)
+        return {
+            "type": "webhook_trigger",
+            "integration": {"id": integration["id"], "provider": integration["provider"]},
+            "run": self.get_run(run["id"]),
+            "session": self.get_session(session["id"]),
+        }
+
+    def due_jobs(self) -> list[dict[str, Any]]:
+        timestamp = now_iso()
+        rows = self.fetch_all(
+            """
+            SELECT * FROM jobs
+            WHERE status = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ?
+            ORDER BY next_run_at
+            """,
+            (timestamp,),
+        )
+        return [self.job_from_row(row) for row in rows]
+
+    def create_integration(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        provider = payload.get("provider")
+        if not provider:
+            raise ValueError("provider is required")
+        if provider not in {"feishu", "dify", "github_actions", "webhook"}:
+            raise ValueError("provider must be feishu, dify, github_actions, or webhook")
+        timestamp = now_iso()
+        integration_id = new_id("int")
+        capabilities = integration_capabilities(provider)
+        secret_material = payload.get("token") or payload.get("secret")
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO integrations
+                (id, tenant_id, project_id, provider, name, base_url, secret_ref, secret_material,
+                 status, capabilities, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    integration_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    provider,
+                    payload.get("name") or provider,
+                    payload.get("base_url"),
+                    token_ref(secret_material),
+                    secret_material,
+                    "configured" if payload.get("base_url") and secret_material else "metadata_only",
+                    json_dumps(capabilities),
+                    json_dumps(payload.get("metadata", {})),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("integration.create", "integration", integration_id, request_id)
+        return self.get_integration(integration_id)
+
+    def list_integrations(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all("SELECT * FROM integrations ORDER BY created_at DESC")
+        return [self.integration_from_row(row) for row in rows]
+
+    def get_integration(self, integration_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM integrations WHERE id = ?", (integration_id,))
+        if row is None:
+            raise KeyError(integration_id)
+        return self.integration_from_row(row)
+
+    def get_integration_secret_material(self, integration_id: str) -> str | None:
+        row = self.fetch_one("SELECT secret_material FROM integrations WHERE id = ?", (integration_id,))
+        if row is None:
+            raise KeyError(integration_id)
+        return row["secret_material"]
+
+    def integration_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "integration",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "provider": row["provider"],
+            "name": row["name"],
+            "base_url": row["base_url"],
+            "secret_ref": row["secret_ref"],
+            "status": row["status"],
+            "capabilities": json_loads(row["capabilities"], {}),
+            "metadata": json_loads(row["metadata"], {}),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def invoke_dify_chat(self, args: dict[str, Any]) -> dict[str, Any]:
+        integration_id = args.get("integration_id")
+        if not integration_id:
+            raise ValueError("integration_id is required")
+        integration = self.get_integration(integration_id)
+        if integration["provider"] != "dify":
+            raise ValueError("integration provider must be dify")
+        query = args.get("query")
+        if not query:
+            raise ValueError("query is required")
+        body = {
+            "inputs": args.get("inputs", {}),
+            "query": query,
+            "response_mode": args.get("response_mode", "blocking"),
+            "user": args.get("user") or "cloudagent-platform",
+        }
+        if args.get("conversation_id"):
+            body["conversation_id"] = args["conversation_id"]
+        return self.invoke_connector_json(
+            integration,
+            "chat-messages",
+            body,
+        )
+
+    def invoke_feishu_message(self, args: dict[str, Any]) -> dict[str, Any]:
+        integration_id = args.get("integration_id")
+        if not integration_id:
+            raise ValueError("integration_id is required")
+        integration = self.get_integration(integration_id)
+        if integration["provider"] != "feishu":
+            raise ValueError("integration provider must be feishu")
+        receive_id = args.get("receive_id")
+        if not receive_id:
+            raise ValueError("receive_id is required")
+        msg_type = args.get("msg_type", "text")
+        content = args.get("content")
+        if content is None:
+            raise ValueError("content is required")
+        if isinstance(content, dict):
+            content_value = json_dumps(content)
+        elif msg_type == "text":
+            content_value = json_dumps({"text": str(content)})
+        else:
+            content_value = str(content)
+        return self.invoke_connector_json(
+            integration,
+            "open-apis/im/v1/messages",
+            {"receive_id": receive_id, "msg_type": msg_type, "content": content_value},
+            query={"receive_id_type": args.get("receive_id_type", "open_id")},
+        )
+
+    def invoke_connector_json(
+        self,
+        integration: dict[str, Any],
+        path: str,
+        body: dict[str, Any],
+        query: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        base_url = integration.get("base_url")
+        if not base_url:
+            raise ValueError("integration base_url is required")
+        token = self.get_integration_secret_material(integration["id"])
+        if not token:
+            raise PermissionError("integration token is not configured")
+        url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+        if query:
+            url = f"{url}?{urlencode(query)}"
+        raw_body = json_dumps(body).encode("utf-8")
+        request = Request(
+            url,
+            data=raw_body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "cloudagent-platform-connector/0.1",
+            },
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                status_code = response.status
+                response_body = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            status_code = exc.code
+            response_body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed_body: Any = json.loads(response_body) if response_body else None
+        except json.JSONDecodeError:
+            parsed_body = response_body
+        return {
+            "provider": integration["provider"],
+            "integration_id": integration["id"],
+            "ok": 200 <= status_code < 400,
+            "request": {
+                "method": "POST",
+                "url": url,
+                "headers": {"Authorization": "Bearer <redacted>", "Content-Type": "application/json"},
+                "json": body,
+            },
+            "response": {"status_code": status_code, "body": parsed_body},
+        }
+
+    def overview(self) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for table in [
+            "agents",
+            "environments",
+            "sessions",
+            "events",
+            "jobs",
+            "job_runs",
+            "workers",
+            "files",
+            "artifacts",
+            "tool_policies",
+            "pending_actions",
+            "usage_records",
+            "integrations",
+        ]:
+            row = self.fetch_one(f"SELECT COUNT(*) AS count FROM {table}", ())
+            counts[table] = int(row["count"]) if row else 0
+        return {
+            "type": "cloudagent.admin.overview",
+            "service": "CloudAgent-Platform",
+            "version": __version__,
+            "counts": counts,
+            "recent_sessions": self.list_sessions()[:5],
+            "recent_jobs": self.list_jobs()[:5],
+            "recent_runs": self.list_runs()[:5],
+            "recent_artifacts": self.list_artifacts()[:5],
+            "pending_actions": self.list_pending_actions()[:5],
+            "workers": self.list_workers(),
+            "integrations": self.list_integrations(),
+        }
+
+
+def integration_capabilities(provider: str) -> dict[str, Any]:
+    if provider == "feishu":
+        return {
+            "api_family": "feishu-open-platform",
+            "webhook_trigger": True,
+            "bot_messages": True,
+            "document_read_write": True,
+            "requires_secret": True,
+        }
+    if provider == "dify":
+        return {
+            "api_family": "dify-v2-compatible",
+            "workflow_run": True,
+            "chat_messages": True,
+            "dataset_access": True,
+            "requires_secret": True,
+        }
+    if provider == "github_actions":
+        return {
+            "api_family": "github-actions",
+            "workflow_dispatch": True,
+            "run_status": True,
+            "requires_secret": True,
+        }
+    return {"api_family": "generic-webhook", "webhook_trigger": True}
+
+
+def sdlc_status_payload() -> dict[str, Any]:
+    return {
+        "type": "cloudagent.sdlc.status",
+        "status": "local-prototype-active",
+        "generated_package": "local/20260616",
+        "implemented_scope": "local-control-plane-prototype",
+        "runtime_capabilities": {
+            "event_store": True,
+            "scheduler_delay_trigger": True,
+            "tool_gateway": True,
+            "local_subprocess_adapter": True,
+            "codex_cli_probe": True,
+            "production_sandbox": False,
+            "full_cluster_runtime": False,
+        },
+        "notes": [
+            "This local service exposes the current implemented prototype contract.",
+            "The full CloudAgent cluster runtime is still in progress.",
+        ],
+    }
+
+
+def current_openapi() -> dict[str, Any]:
+    paths = {
+        "/_ops/healthz": {"get": {"summary": "Health check"}},
+        "/_ops/readyz": {"get": {"summary": "Readiness check"}},
+        "/openapi.json": {"get": {"summary": "Current implemented OpenAPI document"}},
+        "/api/v1/sdlc/status": {"get": {"summary": "Local SDLC/runtime status"}},
+        "/api/v1/system/info": {"get": {"summary": "System information"}},
+        "/api/v1/kernels": {"get": {"summary": "List kernel providers"}},
+        "/api/v1/kernels/{kernel_id}": {"get": {"summary": "Get kernel provider"}},
+        "/api/v1/kernels/{kernel_id}/probe": {"post": {"summary": "Run safe kernel probe"}},
+        "/api/v1/agents": {"get": {"summary": "List agents"}, "post": {"summary": "Create agent"}},
+        "/api/v1/environments": {
+            "get": {"summary": "List environments"},
+            "post": {"summary": "Create environment"},
+        },
+        "/api/v1/sessions": {"get": {"summary": "List sessions"}, "post": {"summary": "Create session"}},
+        "/api/v1/sessions/{session_id}": {"get": {"summary": "Get session"}},
+        "/api/v1/sessions/{session_id}/events": {
+            "get": {"summary": "List session events"},
+            "post": {"summary": "Append event; user events queue worker-side turns"},
+        },
+        "/api/v1/sessions/{session_id}/events/stream": {"get": {"summary": "Stream session events"}},
+        "/api/v1/sessions/{session_id}/artifacts": {"get": {"summary": "List session artifacts"}},
+        "/api/v1/sessions/{session_id}/pending-actions": {"get": {"summary": "List pending actions"}},
+        "/api/v1/sessions/{session_id}/pending-actions/{action_id}/resolve": {
+            "post": {"summary": "Resolve pending action"}
+        },
+        "/api/v1/sessions/{session_id}/audit": {"get": {"summary": "List session audit records"}},
+        "/api/v1/sessions/{session_id}/usage": {"get": {"summary": "List session usage"}},
+        "/api/v1/jobs": {"get": {"summary": "List jobs"}, "post": {"summary": "Create job"}},
+        "/api/v1/jobs/{job_id}": {"get": {"summary": "Get job"}},
+        "/api/v1/jobs/{job_id}/trigger": {"post": {"summary": "Trigger job asynchronously"}},
+        "/api/v1/jobs/{job_id}/enqueue": {"post": {"summary": "Enqueue job for worker execution"}},
+        "/api/v1/runs": {"get": {"summary": "List runs"}},
+        "/api/v1/runs/{run_id}": {"get": {"summary": "Get run"}},
+        "/api/v1/workers": {"get": {"summary": "List workers"}, "post": {"summary": "Register worker"}},
+        "/api/v1/workers/{worker_id}/heartbeat": {"post": {"summary": "Worker heartbeat"}},
+        "/api/v1/workers/{worker_id}/claim": {"post": {"summary": "Claim next queued run"}},
+        "/api/v1/workers/{worker_id}/runs/{run_id}/execute": {
+            "post": {"summary": "Legacy server-side execution of a claimed run with lease_token"}
+        },
+        "/api/v1/workers/{worker_id}/runs/{run_id}/turn/start": {
+            "post": {"summary": "Start a worker-side turn for a claimed run with lease_token"}
+        },
+        "/api/v1/workers/{worker_id}/runs/{run_id}/lease/renew": {
+            "post": {"summary": "Renew a worker-side run lease with lease_token"}
+        },
+        "/api/v1/workers/{worker_id}/runs/{run_id}/events": {
+            "post": {"summary": "Append a worker-side run event with lease_token"}
+        },
+        "/api/v1/workers/{worker_id}/runs/{run_id}/artifacts": {
+            "post": {"summary": "Create a worker-side run artifact with lease_token"}
+        },
+        "/api/v1/workers/{worker_id}/runs/{run_id}/usage": {
+            "post": {"summary": "Record worker-side run usage with lease_token"}
+        },
+        "/api/v1/workers/{worker_id}/runs/{run_id}/tools/execute": {
+            "post": {"summary": "Execute an approved tool action with lease_token"}
+        },
+        "/api/v1/workers/{worker_id}/runs/{run_id}/complete": {
+            "post": {"summary": "Complete a worker-side run with lease_token"}
+        },
+        "/api/v1/integrations": {
+            "get": {"summary": "List integrations"},
+            "post": {"summary": "Create integration"},
+        },
+        "/api/v1/integrations/{integration_id}": {"get": {"summary": "Get integration"}},
+        "/api/v1/webhooks/{provider}/{integration_id}": {
+            "post": {"summary": "Accept signed webhook trigger asynchronously"}
+        },
+        "/api/v1/files": {"get": {"summary": "List files"}, "post": {"summary": "Create JSON-backed file"}},
+        "/api/v1/files/{file_id}": {"get": {"summary": "Get file metadata"}},
+        "/api/v1/files/{file_id}/content": {"get": {"summary": "Download file content"}},
+        "/api/v1/tools": {"get": {"summary": "List built-in tools"}},
+        "/api/v1/tool-policies": {"post": {"summary": "Create tool policy"}},
+        "/api/v1/tool-policies/{policy_id}": {"get": {"summary": "Get tool policy"}},
+        "/api/v1/admin/overview": {"get": {"summary": "Admin overview"}},
+    }
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "CloudAgent-Platform Local Prototype",
+            "version": __version__,
+            "description": "Current implemented local prototype contract. The broader SDLC draft remains in local/20260616/22-openapi-draft.yaml.",
+        },
+        "servers": [{"url": "http://127.0.0.1:8080"}],
+        "security": [{"BearerAuth": []}],
+        "paths": paths,
+        "components": {
+            "securitySchemes": {
+                "BearerAuth": {"type": "http", "scheme": "bearer"},
+                "WebhookToken": {"type": "apiKey", "in": "header", "name": "X-CloudAgent-Webhook-Token"},
+            },
+            "schemas": {
+                "Error": {"type": "object"},
+                "ListResponse": {"type": "object"},
+                "KernelProvider": {"type": "object"},
+                "Agent": {"type": "object"},
+                "Session": {"type": "object"},
+                "Event": {"type": "object"},
+                "Job": {"type": "object"},
+                "Run": {"type": "object"},
+                "Worker": {"type": "object"},
+                "Integration": {"type": "object"},
+            },
+        },
+    }
+
+
+class Runtime:
+    def __init__(
+        self,
+        store: Store,
+        auth_token: str,
+        cors_origins: set[str] | None = None,
+        max_json_bytes: int = DEFAULT_MAX_JSON_BYTES,
+    ) -> None:
+        self.store = store
+        self.auth_token = auth_token
+        self.cors_origins = cors_origins or set()
+        self.max_json_bytes = max_json_bytes
+        self.started_at = now_iso()
+        self._stop = threading.Event()
+        self._scheduler = threading.Thread(target=self.scheduler_loop, daemon=True)
+        self._scheduler.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._scheduler.join(timeout=2)
+        self.store.close()
+
+    def scheduler_loop(self) -> None:
+        while not self._stop.wait(1):
+            try:
+                self.store.requeue_expired_runs(request_id="scheduler")
+            except Exception:
+                continue
+            for job in self.store.due_jobs():
+                try:
+                    self.store.enqueue_job(job["id"], request_id="scheduler", source="schedule")
+                except Exception:
+                    # Keep the prototype scheduler alive; detailed failure events come later.
+                    continue
+
+
+def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "CloudAgentPlatform/0.1"
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_common_headers()
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            self.route("GET")
+
+        def do_POST(self) -> None:
+            self.route("POST")
+
+        def route(self, method: str) -> None:
+            request_id = self.headers.get("X-Request-Id") or new_id("req")
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") if parsed.path != "/" else parsed.path
+            query = parse_qs(parsed.query)
+            parts = [part for part in path.split("/") if part]
+            is_webhook_trigger = (
+                method == "POST"
+                and len(parts) == 5
+                and parts[:3] == ["api", "v1", "webhooks"]
+            )
+
+            try:
+                if method == "GET" and path in {"/", "/admin"}:
+                    self.respond_html(HTTPStatus.OK, ADMIN_HTML)
+                    return
+                if method == "GET" and path == "/_ops/healthz":
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        {
+                            "status": "ok",
+                            "service": "CloudAgent-Platform",
+                            "started_at": runtime.started_at,
+                        },
+                    )
+                    return
+                if method == "GET" and path == "/_ops/readyz":
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        {
+                            "status": "ready",
+                            "service": "CloudAgent-Platform",
+                            "database": Path(runtime.store.path).name,
+                        },
+                    )
+                    return
+                if method == "GET" and path == "/openapi.json":
+                    self.respond_json(HTTPStatus.OK, current_openapi())
+                    return
+                if method == "GET" and path == "/api/v1/sdlc/status":
+                    self.respond_json(HTTPStatus.OK, sdlc_status_payload())
+                    return
+
+                if path.startswith("/api/v1/") and not is_webhook_trigger:
+                    self.require_auth()
+
+                if method == "GET" and path == "/api/v1/system/info":
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        {
+                            "type": "cloudagent.system_info",
+                            "service": "CloudAgent-Platform",
+                            "version": __version__,
+                            "mode": "local-prototype",
+                            "started_at": runtime.started_at,
+                            "auth": "bearer",
+                            "database": Path(runtime.store.path).name,
+                            "runtime_adapter": runtime.store.adapter.manifest(),
+                            "kernels": runtime.store.list_kernels(),
+                        },
+                    )
+                    return
+
+                if method == "GET" and path == "/api/v1/kernels":
+                    self.respond_list(runtime.store.list_kernels())
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "kernels"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_kernel(parts[3]))
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["api", "v1", "kernels"]
+                    and parts[4] == "probe"
+                    and method == "POST"
+                ):
+                    self.respond_json(HTTPStatus.OK, runtime.store.probe_kernel(parts[3]))
+                    return
+
+                if method == "GET" and path == "/api/v1/agents":
+                    self.respond_list(runtime.store.list_agents())
+                    return
+                if method == "POST" and path == "/api/v1/agents":
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_agent(self.read_json(), request_id),
+                    )
+                    return
+
+                if method == "GET" and path == "/api/v1/environments":
+                    self.respond_list(runtime.store.list_environments())
+                    return
+                if method == "POST" and path == "/api/v1/environments":
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_environment(self.read_json(), request_id),
+                    )
+                    return
+
+                if method == "GET" and path == "/api/v1/sessions":
+                    self.respond_list(runtime.store.list_sessions())
+                    return
+                if method == "POST" and path == "/api/v1/sessions":
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_session(self.read_json(), request_id),
+                    )
+                    return
+
+                if len(parts) >= 4 and parts[:3] == ["api", "v1", "sessions"]:
+                    session_id = parts[3]
+                    if len(parts) == 4 and method == "GET":
+                        self.respond_json(HTTPStatus.OK, runtime.store.get_session(session_id))
+                        return
+                    if len(parts) == 5 and parts[4] == "events" and method == "GET":
+                        after_id = query.get("after_id", [None])[0]
+                        self.respond_list(runtime.store.list_events(session_id, after_id))
+                        return
+                    if len(parts) == 5 and parts[4] == "events" and method == "POST":
+                        payload = self.read_json()
+                        event_type = payload.get("type", "user.message")
+                        if event_type == "tool.requested":
+                            event = runtime.store.request_tool(
+                                session_id,
+                                payload.get("payload", payload),
+                                request_id,
+                            )
+                        else:
+                            event = runtime.store.append_event(
+                                session_id,
+                                event_type,
+                                payload.get("payload", {}),
+                                request_id,
+                            )
+                        if event["type"].startswith("user."):
+                            self.respond_json(
+                                HTTPStatus.ACCEPTED,
+                                runtime.store.enqueue_session_turn(
+                                    session_id,
+                                    event,
+                                    request_id=request_id,
+                                    source="api",
+                                ),
+                            )
+                            return
+                        self.respond_json(HTTPStatus.CREATED, event)
+                        return
+                    if len(parts) == 6 and parts[4] == "events" and parts[5] == "stream" and method == "GET":
+                        self.respond_sse(session_id, query)
+                        return
+                    if len(parts) == 5 and parts[4] == "artifacts" and method == "GET":
+                        self.respond_list(runtime.store.list_artifacts(session_id))
+                        return
+                    if len(parts) == 5 and parts[4] == "pending-actions" and method == "GET":
+                        self.respond_list(runtime.store.list_pending_actions(session_id))
+                        return
+                    if (
+                        len(parts) == 7
+                        and parts[4] == "pending-actions"
+                        and parts[6] == "resolve"
+                        and method == "POST"
+                    ):
+                        self.respond_json(
+                            HTTPStatus.OK,
+                            runtime.store.resolve_pending_action(
+                                session_id,
+                                parts[5],
+                                self.read_json(),
+                                request_id,
+                            ),
+                        )
+                        return
+                    if len(parts) == 5 and parts[4] == "audit" and method == "GET":
+                        self.respond_list(self.audit_for_session(session_id))
+                        return
+                    if len(parts) == 5 and parts[4] == "usage" and method == "GET":
+                        self.respond_list(runtime.store.list_usage(session_id))
+                        return
+
+                if method == "GET" and path == "/api/v1/jobs":
+                    self.respond_list(runtime.store.list_jobs())
+                    return
+                if method == "POST" and path == "/api/v1/jobs":
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_job(self.read_json(), request_id),
+                    )
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "jobs"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_job(parts[3]))
+                    return
+                if len(parts) == 5 and parts[:3] == ["api", "v1", "jobs"] and parts[4] == "trigger" and method == "POST":
+                    self.respond_json(
+                        HTTPStatus.ACCEPTED,
+                        runtime.store.trigger_job(parts[3], request_id=request_id),
+                    )
+                    return
+                if len(parts) == 5 and parts[:3] == ["api", "v1", "jobs"] and parts[4] == "enqueue" and method == "POST":
+                    self.respond_json(
+                        HTTPStatus.ACCEPTED,
+                        runtime.store.enqueue_job(parts[3], request_id=request_id),
+                    )
+                    return
+
+                if method == "GET" and path == "/api/v1/workers":
+                    self.respond_list(runtime.store.list_workers())
+                    return
+                if method == "POST" and path == "/api/v1/workers":
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.register_worker(self.read_json(), request_id),
+                    )
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "heartbeat"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.heartbeat_worker(parts[3], request_id),
+                    )
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "claim"
+                    and method == "POST"
+                ):
+                    payload = self.read_json()
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.claim_next_run(
+                            parts[3],
+                            request_id,
+                            int(payload.get("lease_seconds", 900)),
+                        ),
+                    )
+                    return
+                if (
+                    len(parts) == 7
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "execute"
+                    and method == "POST"
+                ):
+                    payload = self.read_json()
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.execute_claimed_run(
+                            parts[3],
+                            parts[5],
+                            payload.get("lease_token"),
+                            request_id,
+                        ),
+                    )
+                    return
+                if (
+                    len(parts) == 8
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "turn"
+                    and parts[7] == "start"
+                    and method == "POST"
+                ):
+                    payload = self.read_json()
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.start_worker_run_turn(
+                            parts[3],
+                            parts[5],
+                            payload.get("lease_token"),
+                            request_id,
+                        ),
+                    )
+                    return
+                if (
+                    len(parts) == 8
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "lease"
+                    and parts[7] == "renew"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.renew_worker_run_lease(parts[3], parts[5], self.read_json(), request_id),
+                    )
+                    return
+                if (
+                    len(parts) == 7
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "events"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.append_worker_run_event(parts[3], parts[5], self.read_json(), request_id),
+                    )
+                    return
+                if (
+                    len(parts) == 7
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "artifacts"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_worker_run_artifact(parts[3], parts[5], self.read_json(), request_id),
+                    )
+                    return
+                if (
+                    len(parts) == 7
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "usage"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.record_worker_run_usage(parts[3], parts[5], self.read_json(), request_id),
+                    )
+                    return
+                if (
+                    len(parts) == 8
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "tools"
+                    and parts[7] == "execute"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.execute_worker_run_tool(parts[3], parts[5], self.read_json(), request_id),
+                    )
+                    return
+                if (
+                    len(parts) == 7
+                    and parts[:3] == ["api", "v1", "workers"]
+                    and parts[4] == "runs"
+                    and parts[6] == "complete"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.complete_worker_run(parts[3], parts[5], self.read_json(), request_id),
+                    )
+                    return
+
+                if method == "GET" and path == "/api/v1/runs":
+                    self.respond_list(runtime.store.list_runs())
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "runs"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_run(parts[3]))
+                    return
+
+                if method == "GET" and path == "/api/v1/integrations":
+                    self.respond_list(runtime.store.list_integrations())
+                    return
+                if method == "POST" and path == "/api/v1/integrations":
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_integration(self.read_json(), request_id),
+                    )
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "integrations"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_integration(parts[3]))
+                    return
+
+                if method == "GET" and path == "/api/v1/files":
+                    self.respond_list(runtime.store.list_files())
+                    return
+                if method == "POST" and path == "/api/v1/files":
+                    self.respond_json(HTTPStatus.CREATED, runtime.store.create_file(self.read_json(), request_id))
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "files"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_file(parts[3]))
+                    return
+                if len(parts) == 5 and parts[:3] == ["api", "v1", "files"] and parts[4] == "content" and method == "GET":
+                    content, content_type = runtime.store.get_file_content(parts[3])
+                    self.respond_bytes(HTTPStatus.OK, content, content_type)
+                    return
+
+                if method == "GET" and path == "/api/v1/tools":
+                    self.respond_list(runtime.store.list_tools())
+                    return
+                if method == "POST" and path == "/api/v1/tool-policies":
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_tool_policy(self.read_json(), request_id),
+                    )
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "tool-policies"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_tool_policy(parts[3]))
+                    return
+
+                if is_webhook_trigger:
+                    webhook_token = self.headers.get("X-CloudAgent-Webhook-Token")
+                    self.respond_json(
+                        HTTPStatus.ACCEPTED,
+                        runtime.store.trigger_integration_webhook(
+                            parts[3],
+                            parts[4],
+                            self.read_json(),
+                            request_id,
+                            webhook_token,
+                        ),
+                    )
+                    return
+
+                if method == "GET" and path == "/api/v1/admin/overview":
+                    self.respond_json(HTTPStatus.OK, runtime.store.overview())
+                    return
+
+                self.respond_error(HTTPStatus.NOT_FOUND, "not_found_error", f"No route for {path}", request_id)
+            except PermissionError as exc:
+                self.respond_error(HTTPStatus.UNAUTHORIZED, "authentication_error", str(exc), request_id)
+            except PayloadTooLargeError as exc:
+                self.respond_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "payload_too_large_error", str(exc), request_id)
+            except KeyError as exc:
+                self.respond_error(HTTPStatus.NOT_FOUND, "not_found_error", str(exc), request_id)
+            except ValueError as exc:
+                self.respond_error(HTTPStatus.BAD_REQUEST, "invalid_request_error", str(exc), request_id)
+
+        def require_auth(self) -> None:
+            auth = self.headers.get("Authorization", "")
+            if not hmac.compare_digest(auth, f"Bearer {runtime.auth_token}"):
+                raise PermissionError("missing or invalid bearer token")
+
+        def read_json(self) -> dict[str, Any]:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise ValueError("invalid Content-Length") from exc
+            if length > runtime.max_json_bytes:
+                raise PayloadTooLargeError("JSON body is too large")
+            if length == 0:
+                return {}
+            raw = self.rfile.read(length)
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("invalid JSON body") from exc
+            if not isinstance(value, dict):
+                raise ValueError("JSON body must be an object")
+            return value
+
+        def audit_for_session(self, session_id: str) -> list[dict[str, Any]]:
+            rows = runtime.store.fetch_all(
+                """
+                SELECT * FROM audit_log
+                WHERE target_id = ? OR id IN (
+                    SELECT audit_ref FROM events WHERE session_id = ? AND audit_ref IS NOT NULL
+                )
+                ORDER BY created_at DESC
+                """,
+                (session_id, session_id),
+            )
+            return [dict(row) for row in rows]
+
+        def respond_sse(self, session_id: str, query: dict[str, list[str]]) -> None:
+            after_id = query.get("after_id", [None])[0] or self.headers.get("Last-Event-ID")
+            once = query.get("once", ["0"])[0] == "1"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_common_headers()
+            self.end_headers()
+            last_id = after_id
+            deadline = time.monotonic() + (0 if once else 30)
+            while True:
+                events = runtime.store.list_events(session_id, last_id)
+                for event in events:
+                    last_id = event["id"]
+                    self.wfile.write(f"id: {event['id']}\n".encode("utf-8"))
+                    self.wfile.write(f"event: {event['type']}\n".encode("utf-8"))
+                    self.wfile.write(f"data: {json_dumps(event)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                if once or time.monotonic() >= deadline:
+                    return
+                self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                time.sleep(2)
+
+        def respond_list(self, data: list[dict[str, Any]]) -> None:
+            self.respond_json(
+                HTTPStatus.OK,
+                {
+                    "data": data,
+                    "first_id": data[0]["id"] if data else None,
+                    "last_id": data[-1]["id"] if data else None,
+                    "has_more": False,
+                },
+            )
+
+        def respond_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+            body = json_dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_common_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def respond_html(self, status: HTTPStatus, html: str) -> None:
+            body = html.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_common_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def respond_bytes(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition", "attachment")
+            self.send_common_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def respond_error(
+            self,
+            status: HTTPStatus,
+            error_type: str,
+            message: str,
+            request_id: str,
+        ) -> None:
+            self.respond_json(
+                status,
+                {
+                    "type": "error",
+                    "error": {
+                        "type": error_type,
+                        "message": message,
+                        "request_id": request_id,
+                    },
+                },
+            )
+
+        def send_common_headers(self) -> None:
+            origin = self.headers.get("Origin")
+            allowed_origin = self.allowed_origin(origin)
+            if allowed_origin:
+                self.send_header("Access-Control-Allow-Origin", allowed_origin)
+                self.send_header("Vary", "Origin")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, X-Request-Id, X-CloudAgent-Webhook-Token",
+            )
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+
+        def allowed_origin(self, origin: str | None) -> str | None:
+            if not origin:
+                return None
+            host = self.headers.get("Host")
+            same_origin = {f"http://{host}", f"https://{host}"} if host else set()
+            if origin in same_origin or origin in runtime.cors_origins:
+                return origin
+            return None
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            print(f"{self.address_string()} - {fmt % args}", flush=True)
+
+    return Handler
+
+
+def parse_csv_set(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def is_loopback_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def run_server(
+    host: str,
+    port: int,
+    database: str,
+    auth_token: str,
+    cors_origins: set[str] | None = None,
+    max_json_bytes: int = DEFAULT_MAX_JSON_BYTES,
+    max_content_bytes: int = DEFAULT_MAX_STORED_CONTENT_BYTES,
+) -> ThreadingHTTPServer:
+    runtime = Runtime(
+        Store(database, max_content_bytes=max_content_bytes),
+        auth_token,
+        cors_origins=cors_origins,
+        max_json_bytes=max_json_bytes,
+    )
+    server = ThreadingHTTPServer((host, port), make_handler(runtime))
+    server.runtime = runtime  # type: ignore[attr-defined]
+    print(f"CloudAgent-Platform listening on http://{host}:{port}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        runtime.stop()
+    return server
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the CloudAgent-Platform local prototype.")
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    parser.add_argument(
+        "--database",
+        default=os.environ.get("CLOUDAGENT_DB", "cloudagent-platform.sqlite3"),
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("CLOUDAGENT_AUTH_TOKEN", DEFAULT_TOKEN),
+    )
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        default=[],
+        help="Allowed cross-origin caller. Can be repeated; same-origin requests do not need this.",
+    )
+    parser.add_argument(
+        "--max-json-bytes",
+        type=int,
+        default=int(os.environ.get("CLOUDAGENT_MAX_JSON_BYTES", str(DEFAULT_MAX_JSON_BYTES))),
+    )
+    parser.add_argument(
+        "--max-content-bytes",
+        type=int,
+        default=int(os.environ.get("CLOUDAGENT_MAX_CONTENT_BYTES", str(DEFAULT_MAX_STORED_CONTENT_BYTES))),
+    )
+    args = parser.parse_args()
+    if not is_loopback_host(args.host) and args.auth_token == DEFAULT_TOKEN:
+        parser.error("CLOUDAGENT_AUTH_TOKEN or --auth-token is required when binding outside localhost")
+    cors_origins = parse_csv_set(os.environ.get("CLOUDAGENT_CORS_ORIGINS"))
+    cors_origins.update(args.cors_origin)
+    run_server(
+        args.host,
+        args.port,
+        args.database,
+        args.auth_token,
+        cors_origins=cors_origins,
+        max_json_bytes=args.max_json_bytes,
+        max_content_bytes=args.max_content_bytes,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+.git
+.gitattributes
+.DS_Store
+.env
+.env.*
+local/
+data/
+logs/
+dist/
+node_modules/
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite3
+*.log

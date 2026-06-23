@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "mode": "deployment-probe",
+  "source_path": "cloud/hfs",
+  "generated_at": "source-tree-placeholder",
+  "files": []
+}

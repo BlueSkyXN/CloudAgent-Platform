@@ -1,0 +1,53 @@
+schema_version = 1
+standard = "hfs-dev"
+pattern = "A"
+runtime_mode = "self-contained-deployment-probe"
+space_root_mode = "flat-remap"
+hfs_dir = "cloud/hfs"
+export_command = "bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space"
+public_port = 7860
+canonical_health_endpoint = "/_ops/healthz"
+readiness_endpoint = "/_ops/readyz"
+release_pin_required = false
+required_files = [
+  "README.md",
+  "Dockerfile",
+  ".dockerignore",
+  "app.py",
+  "healthcheck.sh",
+  "hfs-dev.toml",
+  "BUILD_SOURCE.txt",
+  "BUNDLE_MANIFEST.json",
+]
+source_excludes = [
+  ".git",
+  ".gitattributes",
+  ".env",
+  ".env.local",
+  "local",
+  "data",
+  "logs",
+  "dist",
+  "node_modules",
+  "__pycache__",
+]
+
+[[health_surfaces]]
+name = "health"
+path = "/_ops/healthz"
+required_for_live_smoke = true
+
+[[health_surfaces]]
+name = "readiness"
+path = "/_ops/readyz"
+required_for_live_smoke = true
+
+[[health_surfaces]]
+name = "system-info"
+path = "/api/v1/system/info"
+required_for_live_smoke = true
+
+[[health_surfaces]]
+name = "sdlc-status"
+path = "/api/v1/sdlc/status"
+required_for_live_smoke = true
