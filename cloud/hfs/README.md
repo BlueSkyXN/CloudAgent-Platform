@@ -11,23 +11,20 @@ pinned: false
 
 # CloudAgent-Platform HFS
 
-This Space is the CloudAgent-Platform Hugging Face Docker Space deployment
-probe.
+This Space is the CloudAgent-Platform Hugging Face Docker Space deployment.
 
-It currently verifies the HFS packaging and runtime surface for the 20260616
-SDLC package:
+It runs the current local runtime prototype from a Hugging Face bucket mounted
+into the Docker Space. The Space repository remains a flat wrapper; product
+source is mounted at runtime instead of being copied into the Space root.
+
+Runtime contract:
 
 - Docker Space starts on port `7860`.
-- `/_ops/healthz` reports runtime health.
-- `/_ops/readyz` reports readiness and dependency status.
-- `/api/v1/system/info` exposes HFS deployment metadata.
-- `/api/v1/sdlc/status` exposes the current SDLC package status.
-- `/openapi.json` exposes a minimal OpenAPI contract for the deployment probe.
-
-This is not yet the full CloudAgent runtime. The production product remains a
-multi-kernel, API-first Agent Runtime Platform with Kernel Adapter, Sandbox
-Matrix, Event Store, Tool Gateway, Vault, Artifact, Audit, and Usage surfaces as
-defined in the SDLC package.
+- Source bucket is mounted read-only at `/mnt/cloudagent-runtime`.
+- `CLOUDAGENT_AUTH_TOKEN` must be configured as a Hugging Face Space Secret.
+- `/_ops/healthz`, `/_ops/readyz`, and `/openapi.json` are public operational
+  surfaces.
+- `/api/v1/*` application routes keep the runtime bearer-token boundary.
 
 ## HFS Contract
 
@@ -35,8 +32,8 @@ defined in the SDLC package.
 - Public port: `7860`
 - Canonical health endpoint: `/_ops/healthz`
 - Readiness endpoint: `/_ops/readyz`
-- Runtime mode: `deployment-probe`; `full-runtime` must fail closed unless its
-  dependencies are explicitly configured.
+- Runtime mode: `bucket-mounted-runtime`
+- Runtime source mount: `hf://buckets/BlueSkyXN/cloudagent-platform-hfs-runtime:/mnt/cloudagent-runtime:ro`
 - Export provenance: `BUILD_SOURCE.txt` and `BUNDLE_MANIFEST.json`
 - Export command:
 

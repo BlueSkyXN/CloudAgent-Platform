@@ -57,6 +57,7 @@ copy_file README.md
 copy_file Dockerfile
 copy_file .dockerignore
 copy_file app.py
+copy_file start.sh
 copy_file healthcheck.sh
 copy_file hfs-dev.toml
 
@@ -64,7 +65,9 @@ cat > "${out_dir}/BUILD_SOURCE.txt" <<EOT
 source_repo=https://github.com/BlueSkyXN/CloudAgent-Platform.git
 source_path=cloud/hfs
 bundle_generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-mode=deployment-probe
+mode=bucket-mounted-runtime
+runtime_bucket=BlueSkyXN/cloudagent-platform-hfs-runtime
+runtime_mount=/mnt/cloudagent-runtime
 EOT
 
 python3 - "${out_dir}" "${repo_root}" <<'PY'
@@ -108,9 +111,11 @@ for path in sorted(out_dir.rglob("*")):
 status = git_value("status", "--short")
 manifest = {
     "schema_version": 1,
-    "mode": "deployment-probe",
+    "mode": "bucket-mounted-runtime",
     "source_repo": "https://github.com/BlueSkyXN/CloudAgent-Platform.git",
     "source_path": "cloud/hfs",
+    "runtime_bucket": "BlueSkyXN/cloudagent-platform-hfs-runtime",
+    "runtime_mount": "/mnt/cloudagent-runtime",
     "generated_at": datetime.now(timezone.utc).isoformat(),
     "git_sha": git_value("rev-parse", "--verify", "HEAD"),
     "git_dirty": bool(status),

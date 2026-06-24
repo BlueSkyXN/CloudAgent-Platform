@@ -1,7 +1,7 @@
 schema_version = 1
 standard = "hfs-dev"
 pattern = "A"
-runtime_mode = "self-contained-deployment-probe"
+runtime_mode = "bucket-mounted-runtime"
 space_root_mode = "flat-remap"
 hfs_dir = "cloud/hfs"
 export_command = "bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space"
@@ -14,6 +14,7 @@ required_files = [
   "Dockerfile",
   ".dockerignore",
   "app.py",
+  "start.sh",
   "healthcheck.sh",
   "hfs-dev.toml",
   "BUILD_SOURCE.txt",
@@ -46,6 +47,7 @@ required_for_live_smoke = true
 name = "system-info"
 path = "/api/v1/system/info"
 required_for_live_smoke = true
+requires_bearer_auth = true
 
 [[health_surfaces]]
 name = "sdlc-status"
