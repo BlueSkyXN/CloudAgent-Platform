@@ -1156,5 +1156,42 @@ class LocalPrototypeTest(unittest.TestCase):
             connector_server.server_close()
 
 
+    def test_module_facades_and_openapi_schema_contract(self) -> None:
+        from cloudagent_platform.app import Runtime as AppRuntime
+        from cloudagent_platform.app import Store as AppStore
+        from cloudagent_platform.app import current_openapi, make_handler as app_make_handler
+
+        self.assertIs(AppRuntime, Runtime)
+        self.assertIs(AppStore, Store)
+        self.assertIs(app_make_handler, make_handler)
+
+        openapi = current_openapi()
+        self.assertEqual(openapi["openapi"], "3.1.0")
+        paths = openapi["paths"]
+        self.assertIn("/api/v1/workers/{worker_id}/runs/{run_id}/lease/renew", paths)
+        self.assertIn("/api/v1/workers/{worker_id}/runs/{run_id}/complete", paths)
+        self.assertIn("/api/v1/webhooks/{provider}/{integration_id}", paths)
+
+        components = openapi["components"]
+        schemas = components["schemas"]
+        for schema_name in [
+            "Error",
+            "ListResponse",
+            "Worker",
+            "JobRun",
+            "Integration",
+            "PendingAction",
+            "WorkerLeaseRequest",
+            "WorkerCompleteRequest",
+        ]:
+            self.assertIn(schema_name, schemas)
+            self.assertNotEqual(schemas[schema_name], {"type": "object"})
+        self.assertNotIn("secret_material", json.dumps(schemas["Integration"]))
+        self.assertEqual(
+            components["securitySchemes"]["WebhookToken"]["name"],
+            "X-CloudAgent-Webhook-Token",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

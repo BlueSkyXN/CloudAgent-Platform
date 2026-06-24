@@ -6,9 +6,9 @@ integrations, and an admin control surface.
 
 Current repository state:
 
-- `src/cloudagent_platform/` contains a dependency-free local runtime prototype.
+- `src/cloudagent_platform/` contains a dependency-free local runtime prototype with P0.5 module boundaries for config, utilities, OpenAPI, scheduler, HTTP routing, tool registry, and connector metadata.
 - `cloud/hfs/` contains the Hugging Face Docker Space deployment wrapper.
-- `local/20260616/` contains the SDLC package and OpenAPI draft.
+- `local/20260616/` contains the SDLC package and target OpenAPI draft; the implemented local contract is served by `/openapi.json` from code.
 
 ## Local Prototype
 
