@@ -290,6 +290,7 @@ def execute_locally(client: WorkerClient, run: dict[str, Any]) -> dict[str, Any]
                 kernel_id=adapter.kernel_id,
                 run_id=run_id,
                 worker_id=client.config.worker_id,
+                runtime_policy=started.get("runtime_policy"),
             ),
         )
         final_status = "succeeded" if adapter_result.get("status") == "succeeded" else "failed"

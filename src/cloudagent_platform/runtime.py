@@ -63,6 +63,7 @@ class RuntimeContext:
     kernel_id: str
     run_id: str | None = None
     worker_id: str | None = None
+    runtime_policy: dict[str, Any] | None = None
 
 
 class RuntimeAdapter(Protocol):
@@ -114,6 +115,7 @@ class LocalSubprocessSandboxProvider:
         return {
             "provider_id": self.provider_id,
             "isolation": "local-subprocess",
+            "sandbox_profile_id": "local-subprocess-deny-all",
             "timeout_seconds": self.timeout_seconds,
             "network_policy": "not_granted_to_adapter_payload",
             "filesystem_policy": "temporary_workspace_deleted_after_turn",
@@ -212,10 +214,26 @@ class LocalPrototypeAdapter:
         }
 
     def execute_turn(self, store: RuntimeStore, context: RuntimeContext) -> dict[str, Any]:
+        runtime_policy = context.runtime_policy or {}
+        permission_profile_id = runtime_policy.get("permission_profile_id", "workspace-write")
+        sandbox_profile_id = runtime_policy.get("sandbox_profile_id", "local-subprocess-deny-all")
         store.append_event(
             context.session_id,
             "worker.assigned",
             {"run_id": context.run_id, "worker_id": context.worker_id, "source": context.source},
+            context.request_id,
+            turn_id=context.turn_id,
+        )
+        store.append_event(
+            context.session_id,
+            "runtime.policy_applied",
+            {
+                "run_id": context.run_id,
+                "worker_id": context.worker_id,
+                "permission_profile_id": permission_profile_id,
+                "sandbox_profile_id": sandbox_profile_id,
+                "policy": runtime_policy,
+            },
             context.request_id,
             turn_id=context.turn_id,
         )
@@ -235,9 +253,12 @@ class LocalPrototypeAdapter:
             "sandbox.created",
             {
                 "provider": self.sandbox.provider_id,
+                "permission_profile_id": permission_profile_id,
+                "sandbox_profile_id": sandbox_profile_id,
                 "network_policy": "deny_all",
                 "filesystem_policy": "temporary_workspace_deleted_after_turn",
                 "timeout_seconds": self.sandbox.manifest()["timeout_seconds"],
+                "effective_policy": runtime_policy,
             },
             context.request_id,
             turn_id=context.turn_id,

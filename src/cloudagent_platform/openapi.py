@@ -10,6 +10,10 @@ def current_openapi() -> dict[str, object]:
         "/openapi.json": {"get": {"summary": "Current implemented OpenAPI document"}},
         "/api/v1/sdlc/status": {"get": {"summary": "Local SDLC/runtime status"}},
         "/api/v1/system/info": {"get": {"summary": "System information"}},
+        "/api/v1/permission-profiles": {"get": {"summary": "List permission profiles"}},
+        "/api/v1/permission-profiles/{profile_id}": {"get": {"summary": "Get permission profile"}},
+        "/api/v1/sandbox-profiles": {"get": {"summary": "List sandbox profiles"}},
+        "/api/v1/sandbox-profiles/{profile_id}": {"get": {"summary": "Get sandbox profile"}},
         "/api/v1/kernels": {"get": {"summary": "List kernel providers"}},
         "/api/v1/kernels/{kernel_id}": {"get": {"summary": "Get kernel provider"}},
         "/api/v1/kernels/{kernel_id}/probe": {"post": {"summary": "Run safe kernel probe"}},
@@ -70,6 +74,12 @@ def current_openapi() -> dict[str, object]:
             "post": {"summary": "Create integration"},
         },
         "/api/v1/integrations/{integration_id}": {"get": {"summary": "Get integration"}},
+        "/api/v1/vaults": {"get": {"summary": "List vaults"}, "post": {"summary": "Create vault"}},
+        "/api/v1/vaults/{vault_id}": {"get": {"summary": "Get vault"}},
+        "/api/v1/vaults/{vault_id}/credentials": {
+            "get": {"summary": "List vault credentials"},
+            "post": {"summary": "Create vault credential"},
+        },
         "/api/v1/webhooks/{provider}/{integration_id}": {
             "post": {"summary": "Accept signed webhook trigger asynchronously"}
         },
@@ -124,6 +134,27 @@ def current_openapi() -> dict[str, object]:
                     },
                 },
                 "KernelProvider": {"type": "object", "required": ["id", "type", "capabilities", "status"]},
+                "PermissionProfile": {
+                    "type": "object",
+                    "required": ["id", "type", "status", "tool_policy_defaults"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "type": {"type": "string", "const": "permission_profile"},
+                        "status": {"type": "string"},
+                        "tool_policy_defaults": {"type": "object"},
+                    },
+                },
+                "SandboxProfile": {
+                    "type": "object",
+                    "required": ["id", "type", "status", "provider", "isolation"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "type": {"type": "string", "const": "sandbox_profile"},
+                        "status": {"type": "string"},
+                        "provider": {"type": "string"},
+                        "isolation": {"type": "object"},
+                    },
+                },
                 "Agent": {"type": "object", "required": ["id", "type", "name", "kernel", "version", "status"]},
                 "Environment": {"type": "object", "required": ["id", "type", "name", "runtime_type", "status"]},
                 "Session": {"type": "object", "required": ["id", "type", "status", "turn_status", "last_event_id"]},
@@ -140,6 +171,29 @@ def current_openapi() -> dict[str, object]:
                     "required": ["id", "type", "provider", "name", "status", "capabilities"],
                     "properties": {
                         "secret_ref": {"type": ["string", "null"], "description": "Digest reference only; raw secret values are never returned."}
+                    },
+                },
+                "Vault": {
+                    "type": "object",
+                    "required": ["id", "type", "display_name", "credentials", "status"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "type": {"type": "string", "const": "vault"},
+                        "display_name": {"type": "string"},
+                        "credentials": {"type": "array", "items": {"$ref": "#/components/schemas/VaultCredential"}},
+                    },
+                },
+                "VaultCredential": {
+                    "type": "object",
+                    "required": ["id", "type", "vault_id", "auth", "status"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "type": {"type": "string", "const": "vault_credential"},
+                        "vault_id": {"type": "string"},
+                        "auth": {
+                            "type": "object",
+                            "description": "Redacted auth metadata. The prototype retains only a digest reference and does not provide runtime secret injection.",
+                        },
                     },
                 },
                 "Tool": {"type": "object", "required": ["id", "name", "source", "default_policy", "schema"]},

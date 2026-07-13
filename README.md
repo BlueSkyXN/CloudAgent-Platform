@@ -56,6 +56,15 @@ worker run lease tokens.
 Implemented local runtime surfaces include:
 
 - Agent, Environment, Session, ordered Event Store, and SSE replay.
+- Built-in Permission Profiles and Sandbox Profiles, exposed through
+  `/api/v1/permission-profiles` and `/api/v1/sandbox-profiles`. Environment
+  records now persist `permission_profile_id`, `sandbox_profile_id`,
+  package policy, and per-environment tool policy defaults. The profile
+  vocabulary includes `read-only`, `workspace-write`, and `network-limited`;
+  `danger-full-access` is intentionally visible but blocked for environment
+  creation in this prototype. Only implemented sandbox profiles can create
+  environments; planned/reference sandbox profiles stay visible as roadmap
+  contracts but are blocked until the provider exists.
 - Workers, Jobs, Runs, signed integration webhooks, scheduler delay triggers, and
   session user-event turns. Job triggers, scheduler delay triggers, signed
   integration webhooks, and `user.*` session events create queued runs and return
@@ -74,16 +83,26 @@ Implemented local runtime surfaces include:
   remote fleet yet.
 - A `LocalPrototypeAdapter` runtime boundary backed by a fixed
   `LocalSubprocessSandboxProvider`. It emits `kernel.*`, `sandbox.*`,
-  `worker.*`, artifact, usage, and audit-correlated events, creates a temporary
-  workspace, runs a controlled Python subprocess without shell expansion, and
-  deletes the workspace after the turn.
+  `runtime.policy_applied`, `worker.*`, artifact, usage, and audit-correlated
+  events, creates a temporary workspace, runs a controlled Python subprocess
+  without shell expansion, and deletes the workspace after the turn. Worker-side
+  `/turn/start` returns the effective runtime policy so the worker and control
+  plane report the same sandbox/permission contract.
 - A probe-only `CodexCliProbeAdapter` kernel entry at `codex-cli-probe`. It
   locates `codex`, runs `codex --version`, and reports availability without
   executing prompts, tools, file edits, or shell commands.
 - Minimal Tool Gateway policy flow with `always_allow`, `always_ask`, approval
   resolve, worker-scoped approved action execution, and audit events. Control
   plane requests record/approve/queue tool actions; workers execute approved
-  actions through lease-checked worker endpoints. The current connector-backed
-  built-ins cover `integration.dify.chat` and `integration.feishu.message`.
+  actions through lease-checked worker endpoints. `/api/v1/tools` returns an
+  effective policy matrix with `allow` / `ask` / `deny` decisions and policy
+  source for each built-in tool. The current connector-backed built-ins cover
+  `integration.dify.chat` and `integration.feishu.message`.
+- Minimal Vault API for write-only credential registration. `/api/v1/vaults`
+  and `/api/v1/vaults/{vault_id}/credentials` retain only redacted auth
+  metadata and `secret_ref` digests; plaintext credential material is discarded
+  after the request. Sessions can bind `vault_ids`, and runtime policy events
+  report the bound IDs and count. Runtime secret injection remains disabled
+  until a KMS or broker-backed provider is implemented.
 - JSON-backed local Files, session Artifacts, and placeholder Usage records for
   completed turns.
