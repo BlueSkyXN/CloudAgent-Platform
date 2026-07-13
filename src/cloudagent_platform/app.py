@@ -31,6 +31,20 @@ from .config import (
 from .connectors import integration_capabilities
 from .errors import PayloadTooLargeError
 from .openapi import current_openapi
+from .permissions import (
+    BASE_TOOL_POLICY_DEFAULTS,
+    environment_policy_defaults,
+    get_permission_profile,
+    get_sandbox_profile,
+    list_permission_profiles,
+    list_sandbox_profiles,
+    merge_tool_policy_defaults,
+    more_restrictive_policy_mode,
+    policy_mode_to_decision,
+    validate_environment_policies,
+    validate_profile_for_environment,
+    validate_sandbox_for_environment,
+)
 from .runtime import CodexCliProbeAdapter, LocalPrototypeAdapter, RuntimeAdapter, RuntimeContext
 from .scheduler import Runtime
 from .status import sdlc_status_payload
@@ -82,9 +96,13 @@ class Store:
                 name TEXT NOT NULL,
                 runtime_type TEXT NOT NULL,
                 resource_class TEXT NOT NULL,
+                permission_profile_id TEXT NOT NULL DEFAULT 'workspace-write',
+                sandbox_profile_id TEXT NOT NULL DEFAULT 'local-subprocess-deny-all',
                 network_policy TEXT NOT NULL,
                 filesystem_policy TEXT NOT NULL,
                 secret_policy TEXT NOT NULL,
+                package_policy TEXT NOT NULL DEFAULT '{}',
+                tool_policy_defaults TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -102,6 +120,7 @@ class Store:
                 turn_status TEXT,
                 active_turn_id TEXT,
                 last_event_id TEXT,
+                vault_ids TEXT NOT NULL DEFAULT '[]',
                 metadata TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -257,6 +276,36 @@ class Store:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS vaults (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                metadata TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS vault_credentials (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                vault_id TEXT NOT NULL,
+                auth_type TEXT NOT NULL,
+                mcp_server_url TEXT,
+                secret_ref TEXT,
+                auth_metadata TEXT NOT NULL DEFAULT '{}',
+                metadata TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS integrations (
                 id TEXT PRIMARY KEY,
                 tenant_id TEXT NOT NULL,
@@ -304,6 +353,58 @@ class Store:
             self.conn.execute(
                 "ALTER TABLE job_runs ADD COLUMN lease_generation INTEGER NOT NULL DEFAULT 0"
             )
+        environment_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(environments)").fetchall()
+        }
+        if "permission_profile_id" not in environment_columns:
+            self.conn.execute(
+                "ALTER TABLE environments ADD COLUMN permission_profile_id TEXT NOT NULL DEFAULT 'workspace-write'"
+            )
+        if "sandbox_profile_id" not in environment_columns:
+            self.conn.execute(
+                "ALTER TABLE environments ADD COLUMN sandbox_profile_id TEXT NOT NULL DEFAULT 'local-subprocess-deny-all'"
+            )
+        if "package_policy" not in environment_columns:
+            self.conn.execute("ALTER TABLE environments ADD COLUMN package_policy TEXT NOT NULL DEFAULT '{}'")
+        if "tool_policy_defaults" not in environment_columns:
+            self.conn.execute(
+                "ALTER TABLE environments ADD COLUMN tool_policy_defaults TEXT NOT NULL DEFAULT '{}'"
+            )
+        self.conn.execute(
+            """
+            UPDATE environments
+            SET tool_policy_defaults = ?
+            WHERE tool_policy_defaults IS NULL OR tool_policy_defaults = '{}'
+            """,
+            (json_dumps(BASE_TOOL_POLICY_DEFAULTS),),
+        )
+        self.conn.execute(
+            """
+            UPDATE environments
+            SET package_policy = ?
+            WHERE package_policy IS NULL OR package_policy = '{}'
+            """,
+            (json_dumps({"mode": "none", "allow_runtime_install": False}),),
+        )
+        session_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "vault_ids" not in session_columns:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN vault_ids TEXT NOT NULL DEFAULT '[]'")
+        vault_credential_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(vault_credentials)").fetchall()
+        }
+        if "auth_metadata" not in vault_credential_columns:
+            self.conn.execute(
+                "ALTER TABLE vault_credentials ADD COLUMN auth_metadata TEXT NOT NULL DEFAULT '{}'"
+            )
+        if "secret_material" in vault_credential_columns:
+            self.conn.execute(
+                "UPDATE vault_credentials SET secret_material = NULL WHERE secret_material IS NOT NULL"
+            )
         integration_columns = {
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(integrations)").fetchall()
@@ -316,9 +417,11 @@ class Store:
             return
         self.create_environment(
             {
-                "name": "local-docker-deny-all",
-                "runtime_type": "docker",
+                "name": "local-subprocess-deny-all",
+                "runtime_type": "local-subprocess",
                 "resource_class": {"cpu_limit": 1, "memory_mb": 512, "disk_mb": 1024},
+                "permission_profile_id": "workspace-write",
+                "sandbox_profile_id": "local-subprocess-deny-all",
                 "network_policy": {
                     "mode": "deny_all",
                     "allow_hosts": [],
@@ -337,6 +440,8 @@ class Store:
                     "allow_runtime_injection": False,
                     "allow_model_visible_plaintext": False,
                 },
+                "package_policy": {"mode": "none", "allow_runtime_install": False},
+                "tool_policy_defaults": BASE_TOOL_POLICY_DEFAULTS,
             },
             request_id="seed",
         )
@@ -386,6 +491,18 @@ class Store:
             self.kernel_provider_from_manifest(self.adapter.manifest(), active=True),
             self.kernel_provider_from_manifest(self.probe_adapter.manifest(), active=False),
         ]
+
+    def list_permission_profiles(self) -> list[dict[str, Any]]:
+        return list_permission_profiles()
+
+    def get_permission_profile(self, profile_id: str) -> dict[str, Any]:
+        return get_permission_profile(profile_id)
+
+    def list_sandbox_profiles(self) -> list[dict[str, Any]]:
+        return list_sandbox_profiles()
+
+    def get_sandbox_profile(self, profile_id: str) -> dict[str, Any]:
+        return get_sandbox_profile(profile_id)
 
     def get_kernel(self, kernel_id: str) -> dict[str, Any]:
         for kernel in self.list_kernels():
@@ -496,51 +613,62 @@ class Store:
         resource_class = payload.get(
             "resource_class", {"cpu_limit": 1, "memory_mb": 512, "disk_mb": 1024}
         )
-        network_policy = payload.get(
-            "network_policy",
-            {
-                "mode": "deny_all",
-                "allow_hosts": [],
-                "deny_private_networks": True,
-                "deny_metadata_ip": True,
-            },
+        permission_profile_id = payload.get("permission_profile_id", "workspace-write")
+        sandbox_profile_id = payload.get("sandbox_profile_id", "local-subprocess-deny-all")
+        validate_profile_for_environment(permission_profile_id)
+        sandbox_profile = validate_sandbox_for_environment(sandbox_profile_id)
+        runtime_type = payload.get("runtime_type", "local-subprocess")
+        if sandbox_profile.get("provider") != runtime_type:
+            raise ValueError(
+                f"sandbox profile provider must match runtime_type: "
+                f"{sandbox_profile.get('provider')} != {runtime_type}"
+            )
+        tool_policy_defaults = merge_tool_policy_defaults(
+            permission_profile_id,
+            payload.get("tool_policy_defaults") or {},
         )
+        policy_defaults = environment_policy_defaults(
+            permission_profile_id,
+            sandbox_profile_id,
+        )
+        network_policy = payload.get("network_policy", policy_defaults["network_policy"])
         filesystem_policy = payload.get(
-            "filesystem_policy",
-            {
-                "workspace_root": "/workspace",
-                "writable_paths": ["/workspace"],
-                "read_only_root": True,
-                "allow_host_mounts": False,
-                "allow_docker_socket": False,
-            },
+            "filesystem_policy", policy_defaults["filesystem_policy"]
         )
-        secret_policy = payload.get(
-            "secret_policy",
-            {
-                "mode": "none",
-                "allow_runtime_injection": False,
-                "allow_model_visible_plaintext": False,
-            },
+        secret_policy = payload.get("secret_policy", policy_defaults["secret_policy"])
+        package_policy = payload.get("package_policy", policy_defaults["package_policy"])
+        validate_environment_policies(
+            permission_profile_id,
+            sandbox_profile_id,
+            network_policy,
+            filesystem_policy,
+            secret_policy,
+            package_policy,
         )
         with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO environments
-                (id, tenant_id, project_id, name, runtime_type, resource_class, network_policy,
-                 filesystem_policy, secret_policy, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, tenant_id, project_id, name, runtime_type, resource_class,
+                 permission_profile_id, sandbox_profile_id, network_policy,
+                 filesystem_policy, secret_policy, package_policy, tool_policy_defaults,
+                 status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     env_id,
                     DEFAULT_TENANT_ID,
                     DEFAULT_PROJECT_ID,
                     payload["name"],
-                    payload.get("runtime_type", "docker"),
+                    runtime_type,
                     json_dumps(resource_class),
+                    permission_profile_id,
+                    sandbox_profile_id,
                     json_dumps(network_policy),
                     json_dumps(filesystem_policy),
                     json_dumps(secret_policy),
+                    json_dumps(package_policy),
+                    json_dumps(tool_policy_defaults),
                     "active",
                     timestamp,
                     timestamp,
@@ -571,9 +699,15 @@ class Store:
             "name": row["name"],
             "runtime_type": row["runtime_type"],
             "resource_class": json_loads(row["resource_class"], {}),
+            "permission_profile_id": row["permission_profile_id"],
+            "sandbox_profile_id": row["sandbox_profile_id"],
             "network_policy": json_loads(row["network_policy"], {}),
             "filesystem_policy": json_loads(row["filesystem_policy"], {}),
             "secret_policy": json_loads(row["secret_policy"], {}),
+            "package_policy": json_loads(row["package_policy"], {}),
+            "tool_policy_defaults": json_loads(row["tool_policy_defaults"], {}),
+            "permission_profile": get_permission_profile(row["permission_profile_id"]),
+            "sandbox_profile": get_sandbox_profile(row["sandbox_profile_id"]),
             "status": row["status"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -596,6 +730,15 @@ class Store:
 
         self.get_agent(agent_id)
         self.get_environment(environment_id)
+        vault_ids = payload.get("vault_ids", [])
+        if vault_ids is None:
+            vault_ids = []
+        if not isinstance(vault_ids, list) or not all(isinstance(item, str) for item in vault_ids):
+            raise ValueError("vault_ids must be a list of vault ids")
+        for vault_id in vault_ids:
+            vault = self.get_vault(vault_id)
+            if vault["status"] != "active":
+                raise ValueError(f"vault is not active: {vault_id}")
         timestamp = now_iso()
         session_id = new_id("sess")
         with self._lock:
@@ -603,8 +746,8 @@ class Store:
                 """
                 INSERT INTO sessions
                 (id, tenant_id, project_id, agent_id, environment_id, status, turn_status,
-                 metadata, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 vault_ids, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -614,6 +757,7 @@ class Store:
                     environment_id,
                     "idle",
                     "idle",
+                    json_dumps(vault_ids),
                     json_dumps(payload.get("metadata", {})),
                     timestamp,
                     timestamp,
@@ -654,6 +798,7 @@ class Store:
             "turn_status": row["turn_status"],
             "active_turn_id": row["active_turn_id"],
             "last_event_id": row["last_event_id"],
+            "vault_ids": json_loads(row["vault_ids"], []),
             "metadata": json_loads(row["metadata"], {}),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1005,8 +1150,205 @@ class Store:
             "created_at": row["created_at"],
         }
 
+    def create_vault(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
+        display_name = payload.get("display_name") or payload.get("name")
+        if not display_name:
+            raise ValueError("display_name is required")
+        vault_id = new_id("vault")
+        timestamp = now_iso()
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO vaults
+                (id, tenant_id, project_id, display_name, metadata, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    vault_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    str(display_name),
+                    json_dumps(payload.get("metadata", {})),
+                    "active",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("vault.create", "vault", vault_id, request_id)
+        return self.get_vault(vault_id)
+
+    def list_vaults(self) -> list[dict[str, Any]]:
+        rows = self.fetch_all(
+            "SELECT * FROM vaults WHERE archived_at IS NULL ORDER BY created_at DESC"
+        )
+        return [self.vault_from_row(row) for row in rows]
+
+    def get_vault(self, vault_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM vaults WHERE id = ?", (vault_id,))
+        if row is None:
+            raise KeyError(vault_id)
+        return self.vault_from_row(row)
+
+    def vault_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "type": "vault",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "display_name": row["display_name"],
+            "credentials": self.list_vault_credentials(row["id"], validate_vault=False),
+            "metadata": json_loads(row["metadata"], {}),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "archived_at": row["archived_at"],
+        }
+
+    def create_vault_credential(
+        self,
+        vault_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        vault = self.get_vault(vault_id)
+        if vault["status"] != "active":
+            raise ValueError("vault must be active")
+        auth = payload.get("auth", payload)
+        if not isinstance(auth, dict):
+            raise ValueError("auth must be an object")
+        auth_type = auth.get("type")
+        if auth_type not in {"static_bearer", "mcp_oauth", "environment_variable"}:
+            raise ValueError("auth.type must be static_bearer, mcp_oauth, or environment_variable")
+        secret_material = self.extract_vault_secret(auth)
+        if not self.vault_secret_is_complete(auth_type, secret_material):
+            raise ValueError("credential secret material is required")
+        credential_id = new_id("cred")
+        timestamp = now_iso()
+        auth_metadata = {}
+        if auth_type == "environment_variable":
+            auth_metadata["name"] = secret_material["name"]
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO vault_credentials
+                (id, tenant_id, project_id, vault_id, auth_type, mcp_server_url, secret_ref,
+                 auth_metadata, metadata, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    credential_id,
+                    DEFAULT_TENANT_ID,
+                    DEFAULT_PROJECT_ID,
+                    vault_id,
+                    auth_type,
+                    auth.get("mcp_server_url"),
+                    token_ref(json_dumps(secret_material)),
+                    json_dumps(auth_metadata),
+                    json_dumps(payload.get("metadata", {})),
+                    "reference_only",
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.conn.commit()
+        self.audit("vault_credential.create", "vault_credential", credential_id, request_id)
+        return self.get_vault_credential(credential_id)
+
+    @staticmethod
+    def extract_vault_secret(auth: dict[str, Any]) -> dict[str, Any]:
+        auth_type = auth.get("type")
+        if auth_type == "static_bearer":
+            return {"token": auth.get("token")}
+        if auth_type == "mcp_oauth":
+            return {
+                "access_token": auth.get("access_token"),
+                "refresh_token": auth.get("refresh_token"),
+                "client_secret": auth.get("client_secret"),
+            }
+        if auth_type == "environment_variable":
+            return {
+                "name": auth.get("name"),
+                "value": auth.get("value") or auth.get("secret_value"),
+            }
+        return {}
+
+    @staticmethod
+    def vault_secret_is_complete(auth_type: str, secret_material: dict[str, Any]) -> bool:
+        if auth_type == "static_bearer":
+            return bool(secret_material.get("token"))
+        if auth_type == "mcp_oauth":
+            return bool(secret_material.get("access_token") or secret_material.get("refresh_token"))
+        if auth_type == "environment_variable":
+            return bool(secret_material.get("name") and secret_material.get("value"))
+        return False
+
+    def list_vault_credentials(self, vault_id: str, validate_vault: bool = True) -> list[dict[str, Any]]:
+        if validate_vault:
+            row = self.fetch_one(
+                "SELECT id FROM vaults WHERE id = ? AND archived_at IS NULL",
+                (vault_id,),
+            )
+            if row is None:
+                raise KeyError(vault_id)
+        rows = self.fetch_all(
+            """
+            SELECT * FROM vault_credentials
+            WHERE vault_id = ? AND archived_at IS NULL
+            ORDER BY created_at DESC
+            """,
+            (vault_id,),
+        )
+        return [self.vault_credential_from_row(row) for row in rows]
+
+    def get_vault_credential(self, credential_id: str) -> dict[str, Any]:
+        row = self.fetch_one("SELECT * FROM vault_credentials WHERE id = ?", (credential_id,))
+        if row is None:
+            raise KeyError(credential_id)
+        return self.vault_credential_from_row(row)
+
+    def vault_credential_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        auth: dict[str, Any] = {
+            "type": row["auth_type"],
+            "mcp_server_url": row["mcp_server_url"],
+            "secret_ref": row["secret_ref"],
+        }
+        auth_metadata = json_loads(row["auth_metadata"], {})
+        if row["auth_type"] == "environment_variable" and auth_metadata.get("name"):
+            auth["name"] = auth_metadata["name"]
+        return {
+            "id": row["id"],
+            "type": "vault_credential",
+            "tenant_id": row["tenant_id"],
+            "project_id": row["project_id"],
+            "vault_id": row["vault_id"],
+            "auth": auth,
+            "metadata": json_loads(row["metadata"], {}),
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "archived_at": row["archived_at"],
+        }
+
     def list_tools(self) -> list[dict[str, Any]]:
-        return [{"id": tool["name"], **dict(tool)} for tool in BUILTIN_TOOLS]
+        return [self.tool_descriptor(tool) for tool in BUILTIN_TOOLS]
+
+    def tool_descriptor(
+        self,
+        tool: dict[str, Any],
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        mode, source = self.resolve_tool_policy(tool["name"], session_id=session_id)
+        return {
+            "id": tool["name"],
+            **dict(tool),
+            "risk": "high" if tool["name"] in HIGH_RISK_TOOLS else "standard",
+            "effective_policy": {
+                "mode": mode,
+                "decision": policy_mode_to_decision(mode),
+                "source": source,
+            },
+        }
 
     def create_tool_policy(self, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
         scope = payload.get("scope")
@@ -1059,7 +1401,11 @@ class Store:
             "updated_at": row["updated_at"],
         }
 
-    def resolve_tool_policy(self, tool: str) -> str:
+    def resolve_tool_policy(
+        self,
+        tool: str,
+        session_id: str | None = None,
+    ) -> tuple[str, str]:
         row = self.fetch_one(
             """
             SELECT mode FROM tool_policies
@@ -1069,9 +1415,24 @@ class Store:
             """,
             (tool, tool),
         )
+        source = "tool_policy" if row else ("builtin_high_risk" if tool in HIGH_RISK_TOOLS else "builtin")
+        mode = row["mode"] if row else ("always_ask" if tool in HIGH_RISK_TOOLS else "always_allow")
         if row:
-            return row["mode"]
-        return "always_ask" if tool in HIGH_RISK_TOOLS else "always_allow"
+            policy_mode_to_decision(mode)
+        if session_id:
+            session = self.get_session(session_id)
+            environment_id = session["environment_snapshot"]["id"]
+            environment = self.get_environment(environment_id)
+            environment_defaults = environment.get("tool_policy_defaults", {})
+            if tool in environment_defaults:
+                environment_mode = str(environment_defaults[tool])
+                effective_mode = more_restrictive_policy_mode(environment_mode, mode)
+                if effective_mode == environment_mode and environment_mode != mode:
+                    return effective_mode, "environment"
+                if not row:
+                    return effective_mode, "environment" if effective_mode == environment_mode else source
+                return effective_mode, source
+        return mode, source
 
     def request_tool(self, session_id: str, payload: dict[str, Any], request_id: str) -> dict[str, Any]:
         tool_value = payload.get("tool") or payload.get("name")
@@ -1086,14 +1447,20 @@ class Store:
             raise ValueError(f"unknown tool: {tool}")
         proposed_args = payload.get("args") or payload.get("proposed_args") or {}
         turn_id = payload.get("turn_id") or new_id("turn")
+        mode, policy_source = self.resolve_tool_policy(tool, session_id=session_id)
         requested = self.append_event(
             session_id,
             "tool.requested",
-            {"tool": tool, "proposed_args": proposed_args},
+            {
+                "tool": tool,
+                "proposed_args": proposed_args,
+                "policy_mode": mode,
+                "policy_source": policy_source,
+                "evaluated_permission": policy_mode_to_decision(mode),
+            },
             request_id,
             turn_id=turn_id,
         )
-        mode = self.resolve_tool_policy(tool)
         if mode == "always_deny":
             self.append_event(
                 session_id,
@@ -1351,6 +1718,36 @@ class Store:
             "updated_at": row["updated_at"],
         }
 
+    def runtime_policy_for_session(self, session_id: str) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        environment_id = session["environment_snapshot"]["id"]
+        environment = self.get_environment(environment_id)
+        validate_environment_policies(
+            environment["permission_profile_id"],
+            environment["sandbox_profile_id"],
+            environment["network_policy"],
+            environment["filesystem_policy"],
+            environment["secret_policy"],
+            environment["package_policy"],
+        )
+        return {
+            "environment_id": environment["id"],
+            "environment_name": environment["name"],
+            "runtime_type": environment["runtime_type"],
+            "permission_profile_id": environment["permission_profile_id"],
+            "sandbox_profile_id": environment["sandbox_profile_id"],
+            "permission_profile": environment["permission_profile"],
+            "sandbox_profile": environment["sandbox_profile"],
+            "vault_ids": session["vault_ids"],
+            "vaults_bound_count": len(session["vault_ids"]),
+            "resource_class": environment["resource_class"],
+            "network_policy": environment["network_policy"],
+            "filesystem_policy": environment["filesystem_policy"],
+            "secret_policy": environment["secret_policy"],
+            "package_policy": environment["package_policy"],
+            "tool_policy_defaults": environment["tool_policy_defaults"],
+        }
+
     def run_adapter_turn(
         self,
         session_id: str,
@@ -1389,6 +1786,7 @@ class Store:
                 kernel_id=self.adapter.kernel_id,
                 run_id=run_id,
                 worker_id=worker_id,
+                runtime_policy=self.runtime_policy_for_session(session_id),
             ),
         )
         timestamp = now_iso()
@@ -1912,6 +2310,7 @@ class Store:
             "run": self.get_run(run_id),
             "session": self.get_session(run["session_id"]),
             "adapter": self.adapter.manifest(),
+            "runtime_policy": self.runtime_policy_for_session(run["session_id"]),
         }
 
     def renew_worker_run_lease(
@@ -2661,6 +3060,8 @@ class Store:
             "tool_policies",
             "pending_actions",
             "usage_records",
+            "vaults",
+            "vault_credentials",
             "integrations",
         ]:
             row = self.fetch_one(f"SELECT COUNT(*) AS count FROM {table}", ())
@@ -2670,10 +3071,14 @@ class Store:
             "service": "CloudAgent-Platform",
             "version": __version__,
             "counts": counts,
+            "permission_profiles": self.list_permission_profiles(),
+            "sandbox_profiles": self.list_sandbox_profiles(),
+            "tools": self.list_tools(),
             "recent_sessions": self.list_sessions()[:5],
             "recent_jobs": self.list_jobs()[:5],
             "recent_runs": self.list_runs()[:5],
             "recent_artifacts": self.list_artifacts()[:5],
+            "vaults": self.list_vaults()[:5],
             "pending_actions": self.list_pending_actions()[:5],
             "workers": self.list_workers(),
             "integrations": self.list_integrations(),

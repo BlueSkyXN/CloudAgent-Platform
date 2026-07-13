@@ -121,6 +121,12 @@ class LocalPrototypeTest(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIsInstance(payload, dict)
 
+        status, info = self.request("GET", "/api/v1/system/info")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(info, dict)
+        self.assertIn("permission_profiles", info)
+        self.assertIn("sandbox_profiles", info)
+
         status, openapi = self.request("GET", "/openapi.json", token=None)
         self.assertEqual(status, 200)
         self.assertIsInstance(openapi, dict)
@@ -138,6 +144,178 @@ class LocalPrototypeTest(unittest.TestCase):
         self.assertIsInstance(probe, dict)
         self.assertEqual(probe["dry_run"], True)
         self.assertIn("available", probe["probe"])
+
+    def test_permission_and_sandbox_profile_contracts(self) -> None:
+        status, profiles = self.request("GET", "/api/v1/permission-profiles")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(profiles, dict)
+        profile_ids = [item["id"] for item in profiles["data"]]
+        self.assertIn("read-only", profile_ids)
+        self.assertIn("workspace-write", profile_ids)
+        self.assertIn("danger-full-access", profile_ids)
+        danger = next(item for item in profiles["data"] if item["id"] == "danger-full-access")
+        self.assertEqual(danger["status"], "blocked")
+        self.assertEqual(danger["create_environment_allowed"], False)
+
+        status, sandbox_profiles = self.request("GET", "/api/v1/sandbox-profiles")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(sandbox_profiles, dict)
+        sandbox_ids = [item["id"] for item in sandbox_profiles["data"]]
+        self.assertIn("local-subprocess-deny-all", sandbox_ids)
+        self.assertIn("seccomp-chroot-network-gated", sandbox_ids)
+
+        status, error = self.request(
+            "POST",
+            "/api/v1/environments",
+            {"name": "Unsafe env", "permission_profile_id": "danger-full-access"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(error, dict)
+
+        status, error = self.request(
+            "POST",
+            "/api/v1/environments",
+            {"name": "Planned sandbox env", "sandbox_profile_id": "docker-deny-all"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(error, dict)
+
+        status, error = self.request(
+            "POST",
+            "/api/v1/environments",
+            {
+                "name": "Readonly weakened env",
+                "permission_profile_id": "read-only",
+                "tool_policy_defaults": {"external.http": "always_allow"},
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(error, dict)
+
+        status, strict_env = self.request(
+            "POST",
+            "/api/v1/environments",
+            {
+                "name": "Readonly strict env",
+                "permission_profile_id": "read-only",
+                "tool_policy_defaults": {"artifact.create": "always_deny"},
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(strict_env, dict)
+        self.assertEqual(strict_env["tool_policy_defaults"]["artifact.create"], "always_deny")
+
+        status, error = self.request(
+            "POST",
+            "/api/v1/environments",
+            {
+                "name": "Readonly writable env",
+                "permission_profile_id": "read-only",
+                "filesystem_policy": {
+                    "workspace_root": "/workspace",
+                    "writable_paths": ["/workspace"],
+                    "read_only_root": True,
+                    "allow_host_mounts": False,
+                    "allow_docker_socket": False,
+                },
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(error, dict)
+
+        status, error = self.request(
+            "POST",
+            "/api/v1/environments",
+            {
+                "name": "Network escalation env",
+                "permission_profile_id": "workspace-write",
+                "network_policy": {"mode": "allow_all"},
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(error, dict)
+
+        status, env = self.request(
+            "POST",
+            "/api/v1/environments",
+            {
+                "name": "Readonly env",
+                "runtime_type": "local-subprocess",
+                "permission_profile_id": "read-only",
+                "sandbox_profile_id": "local-subprocess-deny-all",
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(env, dict)
+        self.assertEqual(env["permission_profile_id"], "read-only")
+        self.assertEqual(env["sandbox_profile_id"], "local-subprocess-deny-all")
+        self.assertEqual(env["filesystem_policy"]["writable_paths"], [])
+        self.assertEqual(env["tool_policy_defaults"]["artifact.create"], "always_ask")
+        self.assertEqual(env["tool_policy_defaults"]["external.http"], "always_deny")
+
+        status, agent = self.request("POST", "/api/v1/agents", {"name": "Policy agent"})
+        self.assertEqual(status, 201)
+        self.assertIsInstance(agent, dict)
+        status, session = self.request(
+            "POST",
+            "/api/v1/sessions",
+            {"agent_id": agent["id"], "environment_id": env["id"]},
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(session, dict)
+
+        status, requested = self.request(
+            "POST",
+            f"/api/v1/sessions/{session['id']}/events",
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "tool": "artifact.create",
+                    "args": {"name": "needs-approval.txt", "content": "gated"},
+                },
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(requested, dict)
+        self.assertEqual(requested["payload"]["policy_mode"], "always_ask")
+        self.assertEqual(requested["payload"]["evaluated_permission"], "ask")
+
+        status, pending = self.request("GET", f"/api/v1/sessions/{session['id']}/pending-actions")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["data"][0]["tool"], "artifact.create")
+        self.assertEqual(pending["data"][0]["status"], "pending")
+
+        status, policy = self.request(
+            "POST",
+            "/api/v1/tool-policies",
+            {"scope": "external.http", "mode": "always_allow"},
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(policy, dict)
+        status, denied = self.request(
+            "POST",
+            f"/api/v1/sessions/{session['id']}/events",
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "tool": "external.http",
+                    "args": {"url": "https://example.invalid", "method": "GET"},
+                },
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(denied, dict)
+        self.assertEqual(denied["payload"]["policy_mode"], "always_deny")
+        self.assertEqual(denied["payload"]["policy_source"], "environment")
+        self.assertEqual(denied["payload"]["evaluated_permission"], "deny")
+
+        status, tools = self.request("GET", "/api/v1/tools")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(tools, dict)
+        external_http = next(item for item in tools["data"] if item["name"] == "external.http")
+        self.assertEqual(external_http["effective_policy"]["decision"], "allow")
+        self.assertEqual(external_http["risk"], "high")
 
     def test_admin_does_not_embed_default_token_and_body_limit(self) -> None:
         status, html = self.request("GET", "/admin", token=None)
@@ -277,6 +455,135 @@ class LocalPrototypeTest(unittest.TestCase):
         self.assertIn("run.queued", event_types)
         self.assertIn("job.triggered", event_types)
         self.assertNotIn("kernel.started", event_types)
+
+    def test_vault_credentials_are_write_only_and_sessions_bind_vault_refs(self) -> None:
+        status, vault = self.request(
+            "POST",
+            "/api/v1/vaults",
+            {"display_name": "GitHub vault", "metadata": {"scope": "unit-test"}},
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(vault, dict)
+        self.assertEqual(vault["type"], "vault")
+        self.assertEqual(vault["credentials"], [])
+
+        status, missing_vault = self.request("GET", "/api/v1/vaults/vault_missing/credentials")
+        self.assertEqual(status, 404)
+        self.assertIsInstance(missing_vault, dict)
+
+        status, missing_secret = self.request(
+            "POST",
+            f"/api/v1/vaults/{vault['id']}/credentials",
+            {"auth": {"type": "static_bearer", "mcp_server_url": "https://github.example/mcp"}},
+        )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(missing_secret, dict)
+
+        status, credential = self.request(
+            "POST",
+            f"/api/v1/vaults/{vault['id']}/credentials",
+            {
+                "auth": {
+                    "type": "static_bearer",
+                    "mcp_server_url": "https://github.example/mcp",
+                    "token": "vault-secret-token",
+                }
+            },
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(credential, dict)
+        self.assertEqual(credential["type"], "vault_credential")
+        self.assertEqual(credential["status"], "reference_only")
+        self.assertNotIn("vault-secret-token", json.dumps(credential))
+        self.assertTrue(credential["auth"]["secret_ref"].startswith("sha256:"))
+        stored = self.runtime.store.fetch_one(
+            "SELECT * FROM vault_credentials WHERE id = ?",
+            (credential["id"],),
+        )
+        self.assertIsNotNone(stored)
+        self.assertNotIn("secret_material", stored.keys())
+        self.assertNotIn("vault-secret-token", json.dumps(dict(stored)))
+
+        status, vault_after = self.request("GET", f"/api/v1/vaults/{vault['id']}")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(vault_after, dict)
+        self.assertEqual(len(vault_after["credentials"]), 1)
+        self.assertNotIn("vault-secret-token", json.dumps(vault_after))
+
+        status, agent = self.request("POST", "/api/v1/agents", {"name": "Vault agent"})
+        self.assertEqual(status, 201)
+        self.assertIsInstance(agent, dict)
+        status, session = self.request(
+            "POST",
+            "/api/v1/sessions",
+            {"agent_id": agent["id"], "vault_ids": [vault["id"]]},
+        )
+        self.assertEqual(status, 201)
+        self.assertIsInstance(session, dict)
+        self.assertEqual(session["vault_ids"], [vault["id"]])
+
+        status, queued = self.request(
+            "POST",
+            f"/api/v1/sessions/{session['id']}/events",
+            {"type": "user.message", "payload": {"text": "run with vault"}},
+        )
+        self.assertEqual(status, 202)
+        self.assertIsInstance(queued, dict)
+        result = run_once(
+            WorkerConfig(
+                base_url=self.base,
+                token="test-token",
+                worker_id="worker_vault_1",
+                name="Vault worker",
+                lease_seconds=60,
+            )
+        )
+        self.assertEqual(result["claimed"], True)
+        self.assertEqual(result["run"]["status"], "succeeded")
+
+        status, events = self.request("GET", f"/api/v1/sessions/{session['id']}/events")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(events, dict)
+        policy_events = [event for event in events["data"] if event["type"] == "runtime.policy_applied"]
+        self.assertEqual(policy_events[0]["payload"]["policy"]["vault_ids"], [vault["id"]])
+        self.assertEqual(policy_events[0]["payload"]["policy"]["vaults_bound_count"], 1)
+        self.assertNotIn("vault-secret-token", json.dumps(events))
+
+    def test_store_migration_scrubs_legacy_vault_secret_and_backfills_policy(self) -> None:
+        database = str(Path(self.tmp.name) / "legacy.sqlite3")
+        store = Store(database)
+        try:
+            vault = store.create_vault({"display_name": "Legacy vault"}, "legacy")
+            credential = store.create_vault_credential(
+                vault["id"],
+                {"auth": {"type": "static_bearer", "token": "discarded-secret"}},
+                "legacy",
+            )
+            store.conn.execute("ALTER TABLE vault_credentials ADD COLUMN secret_material TEXT")
+            store.conn.execute(
+                "UPDATE vault_credentials SET secret_material = ? WHERE id = ?",
+                ("legacy-plaintext", credential["id"]),
+            )
+            store.conn.execute("UPDATE environments SET tool_policy_defaults = '{}'")
+            store.conn.commit()
+        finally:
+            store.close()
+
+        migrated = Store(database)
+        try:
+            row = migrated.fetch_one(
+                "SELECT secret_material FROM vault_credentials WHERE id = ?",
+                (credential["id"],),
+            )
+            self.assertIsNotNone(row)
+            self.assertIsNone(row["secret_material"])
+            environment = migrated.list_environments()[0]
+            self.assertEqual(
+                environment["tool_policy_defaults"]["external.http"],
+                "always_ask",
+            )
+        finally:
+            migrated.close()
 
     def test_worker_registration_heartbeat_and_job_run_assignment(self) -> None:
         status, worker = self.request(
@@ -505,10 +812,17 @@ class LocalPrototypeTest(unittest.TestCase):
         self.assertIsInstance(events, dict)
         event_types = [event["type"] for event in events["data"]]
         self.assertIn("session.running", event_types)
+        self.assertIn("runtime.policy_applied", event_types)
         self.assertIn("kernel.started", event_types)
         self.assertIn("sandbox.created", event_types)
         self.assertIn("sandbox.cleanup", event_types)
         self.assertIn("session.idle", event_types)
+        policy_events = [event for event in events["data"] if event["type"] == "runtime.policy_applied"]
+        self.assertEqual(policy_events[0]["payload"]["permission_profile_id"], "workspace-write")
+        self.assertEqual(policy_events[0]["payload"]["sandbox_profile_id"], "local-subprocess-deny-all")
+        sandbox_events = [event for event in events["data"] if event["type"] == "sandbox.created"]
+        self.assertEqual(sandbox_events[0]["payload"]["permission_profile_id"], "workspace-write")
+        self.assertEqual(sandbox_events[0]["payload"]["sandbox_profile_id"], "local-subprocess-deny-all")
 
     def test_worker_writeback_requires_assigned_worker(self) -> None:
         status, agent = self.request(
@@ -1168,6 +1482,10 @@ class LocalPrototypeTest(unittest.TestCase):
         openapi = current_openapi()
         self.assertEqual(openapi["openapi"], "3.1.0")
         paths = openapi["paths"]
+        self.assertIn("/api/v1/permission-profiles", paths)
+        self.assertIn("/api/v1/sandbox-profiles", paths)
+        self.assertIn("/api/v1/vaults", paths)
+        self.assertIn("/api/v1/vaults/{vault_id}/credentials", paths)
         self.assertIn("/api/v1/workers/{worker_id}/runs/{run_id}/lease/renew", paths)
         self.assertIn("/api/v1/workers/{worker_id}/runs/{run_id}/complete", paths)
         self.assertIn("/api/v1/webhooks/{provider}/{integration_id}", paths)
@@ -1177,9 +1495,13 @@ class LocalPrototypeTest(unittest.TestCase):
         for schema_name in [
             "Error",
             "ListResponse",
+            "PermissionProfile",
+            "SandboxProfile",
             "Worker",
             "JobRun",
             "Integration",
+            "Vault",
+            "VaultCredential",
             "PendingAction",
             "WorkerLeaseRequest",
             "WorkerCompleteRequest",

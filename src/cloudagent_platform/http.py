@@ -92,8 +92,31 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                             "database": Path(runtime.store.path).name,
                             "runtime_adapter": runtime.store.adapter.manifest(),
                             "kernels": runtime.store.list_kernels(),
+                            "permission_profiles": runtime.store.list_permission_profiles(),
+                            "sandbox_profiles": runtime.store.list_sandbox_profiles(),
                         },
                     )
+                    return
+
+                if method == "GET" and path == "/api/v1/permission-profiles":
+                    self.respond_list(runtime.store.list_permission_profiles())
+                    return
+                if (
+                    len(parts) == 4
+                    and parts[:3] == ["api", "v1", "permission-profiles"]
+                    and method == "GET"
+                ):
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_permission_profile(parts[3]))
+                    return
+                if method == "GET" and path == "/api/v1/sandbox-profiles":
+                    self.respond_list(runtime.store.list_sandbox_profiles())
+                    return
+                if (
+                    len(parts) == 4
+                    and parts[:3] == ["api", "v1", "sandbox-profiles"]
+                    and method == "GET"
+                ):
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_sandbox_profile(parts[3]))
                     return
 
                 if method == "GET" and path == "/api/v1/kernels":
@@ -402,6 +425,35 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                     return
                 if len(parts) == 4 and parts[:3] == ["api", "v1", "integrations"] and method == "GET":
                     self.respond_json(HTTPStatus.OK, runtime.store.get_integration(parts[3]))
+                    return
+
+                if method == "GET" and path == "/api/v1/vaults":
+                    self.respond_list(runtime.store.list_vaults())
+                    return
+                if method == "POST" and path == "/api/v1/vaults":
+                    self.respond_json(HTTPStatus.CREATED, runtime.store.create_vault(self.read_json(), request_id))
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "vaults"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_vault(parts[3]))
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["api", "v1", "vaults"]
+                    and parts[4] == "credentials"
+                    and method == "GET"
+                ):
+                    self.respond_list(runtime.store.list_vault_credentials(parts[3]))
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["api", "v1", "vaults"]
+                    and parts[4] == "credentials"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.CREATED,
+                        runtime.store.create_vault_credential(parts[3], self.read_json(), request_id),
+                    )
                     return
 
                 if method == "GET" and path == "/api/v1/files":
