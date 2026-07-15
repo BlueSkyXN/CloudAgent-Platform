@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
-from .admin import ADMIN_HTML
+from .console import get_console_asset
 from .errors import PayloadTooLargeError
 from .openapi import current_openapi
 from .scheduler import Runtime
@@ -20,7 +20,7 @@ from .status import sdlc_status_payload
 
 def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "CloudAgentPlatform/0.1"
+        server_version = f"CloudAgentPlatform/{__version__}"
 
         def do_OPTIONS(self) -> None:
             self.send_response(HTTPStatus.NO_CONTENT)
@@ -46,8 +46,9 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
             )
 
             try:
-                if method == "GET" and path in {"/", "/admin"}:
-                    self.respond_html(HTTPStatus.OK, ADMIN_HTML)
+                console_asset = get_console_asset(path) if method == "GET" else None
+                if console_asset is not None:
+                    self.respond_console_asset(HTTPStatus.OK, console_asset)
                     return
                 if method == "GET" and path == "/_ops/healthz":
                     self.respond_json(
@@ -426,6 +427,19 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                 if len(parts) == 4 and parts[:3] == ["api", "v1", "integrations"] and method == "GET":
                     self.respond_json(HTTPStatus.OK, runtime.store.get_integration(parts[3]))
                     return
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["api", "v1", "integrations"]
+                    and parts[4] == "credential"
+                    and method == "POST"
+                ):
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.register_integration_credential(
+                            parts[3], self.read_json(), request_id
+                        ),
+                    )
+                    return
 
                 if method == "GET" and path == "/api/v1/vaults":
                     self.respond_list(runtime.store.list_vaults())
@@ -470,8 +484,27 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                     self.respond_bytes(HTTPStatus.OK, content, content_type)
                     return
 
+                if method == "GET" and path == "/api/v1/artifacts":
+                    self.respond_list(runtime.store.list_artifacts())
+                    return
+                if len(parts) == 4 and parts[:3] == ["api", "v1", "artifacts"] and method == "GET":
+                    self.respond_json(HTTPStatus.OK, runtime.store.get_artifact(parts[3]))
+                    return
+                if (
+                    len(parts) == 5
+                    and parts[:3] == ["api", "v1", "artifacts"]
+                    and parts[4] == "content"
+                    and method == "GET"
+                ):
+                    content, content_type = runtime.store.get_artifact_content(parts[3])
+                    self.respond_bytes(HTTPStatus.OK, content, content_type)
+                    return
+
                 if method == "GET" and path == "/api/v1/tools":
                     self.respond_list(runtime.store.list_tools())
+                    return
+                if method == "GET" and path == "/api/v1/tool-policies":
+                    self.respond_list(runtime.store.list_tool_policies())
                     return
                 if method == "POST" and path == "/api/v1/tool-policies":
                     self.respond_json(
@@ -499,6 +532,12 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
 
                 if method == "GET" and path == "/api/v1/admin/overview":
                     self.respond_json(HTTPStatus.OK, runtime.store.overview())
+                    return
+                if method == "POST" and path == "/api/v1/admin/showcase/bootstrap":
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.bootstrap_showcase(request_id),
+                    )
                     return
 
                 self.respond_error(HTTPStatus.NOT_FOUND, "not_found_error", f"No route for {path}", request_id)
@@ -587,6 +626,7 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.send_common_headers()
             self.end_headers()
             self.wfile.write(body)
@@ -596,15 +636,26 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.send_common_headers()
             self.end_headers()
             self.wfile.write(body)
+
+        def respond_console_asset(self, status: HTTPStatus, asset: Any) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", asset.content_type)
+            self.send_header("Content-Length", str(len(asset.content)))
+            self.send_header("Cache-Control", asset.cache_control)
+            self.send_common_headers()
+            self.end_headers()
+            self.wfile.write(asset.content)
 
         def respond_bytes(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Disposition", "attachment")
+            self.send_header("Cache-Control", "no-store")
             self.send_common_headers()
             self.end_headers()
             self.wfile.write(body)
@@ -641,6 +692,13 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Permissions-Policy", "camera=(), geolocation=(), microphone=(), payment=(), usb=()")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; "
+                "object-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'",
+            )
 
         def allowed_origin(self, origin: str | None) -> str | None:
             if not origin:

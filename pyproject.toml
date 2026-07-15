@@ -1,7 +1,7 @@
 [project]
 name = "cloudagent-platform"
-version = "0.1.0"
-description = "API-first cloud Agent cluster platform prototype."
+version = "0.2.0"
+description = "Governed cloud Agent runtime control plane and showcase console."
 requires-python = ">=3.11"
 dependencies = []
 
@@ -12,3 +12,6 @@ cloudagent-worker = "cloudagent_platform.worker:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-data]
+cloudagent_platform = ["web/*.html", "web/*.css", "web/*.js", "web/*.svg"]

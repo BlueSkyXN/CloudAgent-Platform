@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">CloudAgent</title>
+  <rect width="64" height="64" rx="10" fill="#102033"/>
+  <path d="M15 18h34v28H15z" fill="none" stroke="#dce7ff" stroke-width="4"/>
+  <path d="M23 38V26h18v12" fill="none" stroke="#57bdb4" stroke-width="4"/>
+  <circle cx="23" cy="38" r="4" fill="#3156d3"/>
+  <circle cx="41" cy="38" r="4" fill="#c87900"/>
+</svg>

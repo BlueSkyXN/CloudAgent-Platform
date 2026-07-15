@@ -17,8 +17,6 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from . import __version__
-from .admin import ADMIN_HTML
 from .config import (
     DEFAULT_MAX_JSON_BYTES,
     DEFAULT_MAX_STORED_CONTENT_BYTES,
@@ -60,6 +58,11 @@ class Store:
         self.adapter: RuntimeAdapter = LocalPrototypeAdapter()
         self.probe_adapter = CodexCliProbeAdapter()
         self._lock = threading.RLock()
+        self._legacy_integration_secret_scrubbed = False
+        # Connector credentials are process-local. SQLite keeps only an opaque
+        # digest reference so a persisted control-plane database cannot recover
+        # outbound tokens after a restart.
+        self._integration_secrets: dict[str, str] = {}
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.init_schema()
@@ -251,6 +254,8 @@ class Store:
                 resolved_by TEXT,
                 resolved_at TEXT,
                 resolution_reason TEXT,
+                execution_run_id TEXT,
+                execution_lease_generation INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -314,8 +319,8 @@ class Store:
                 name TEXT NOT NULL,
                 base_url TEXT,
                 secret_ref TEXT,
-                secret_material TEXT,
                 status TEXT NOT NULL,
+                credential_status TEXT NOT NULL DEFAULT 'registration_required',
                 capabilities TEXT NOT NULL,
                 metadata TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -341,6 +346,11 @@ class Store:
                 self.conn.execute(statement)
             self.ensure_schema_columns()
             self.conn.commit()
+            if self._legacy_integration_secret_scrubbed:
+                # DROP COLUMN removes the schema surface; VACUUM rewrites pages
+                # so old plaintext is not retained in the SQLite freelist.
+                self.conn.execute("VACUUM")
+                self._legacy_integration_secret_scrubbed = False
 
     def ensure_schema_columns(self) -> None:
         columns = {
@@ -409,8 +419,31 @@ class Store:
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(integrations)").fetchall()
         }
-        if "secret_material" not in integration_columns:
-            self.conn.execute("ALTER TABLE integrations ADD COLUMN secret_material TEXT")
+        if "credential_status" not in integration_columns:
+            self.conn.execute(
+                "ALTER TABLE integrations ADD COLUMN credential_status TEXT NOT NULL DEFAULT 'registration_required'"
+            )
+        if "secret_material" in integration_columns:
+            self.conn.execute(
+                "UPDATE integrations SET secret_material = NULL WHERE secret_material IS NOT NULL"
+            )
+            self.conn.execute("ALTER TABLE integrations DROP COLUMN secret_material")
+            self._legacy_integration_secret_scrubbed = True
+        self.conn.execute(
+            "UPDATE integrations SET credential_status = 'registration_required', "
+            "status = CASE WHEN base_url IS NULL OR base_url = '' THEN 'metadata_only' "
+            "ELSE 'credential_required' END"
+        )
+        pending_action_columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(pending_actions)").fetchall()
+        }
+        if "execution_run_id" not in pending_action_columns:
+            self.conn.execute("ALTER TABLE pending_actions ADD COLUMN execution_run_id TEXT")
+        if "execution_lease_generation" not in pending_action_columns:
+            self.conn.execute(
+                "ALTER TABLE pending_actions ADD COLUMN execution_lease_generation INTEGER"
+            )
 
     def seed_defaults(self) -> None:
         if self.list_environments():
@@ -1040,6 +1073,15 @@ class Store:
             raise KeyError(artifact_id)
         return self.artifact_from_row(row)
 
+    def get_artifact_content(self, artifact_id: str) -> tuple[bytes, str]:
+        row = self.fetch_one(
+            "SELECT content, content_type FROM artifacts WHERE id = ?",
+            (artifact_id,),
+        )
+        if row is None:
+            raise KeyError(artifact_id)
+        return str(row["content"]).encode("utf-8"), row["content_type"]
+
     def artifact_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": row["id"],
@@ -1338,10 +1380,15 @@ class Store:
         tool: dict[str, Any],
         session_id: str | None = None,
     ) -> dict[str, Any]:
-        mode, source = self.resolve_tool_policy(tool["name"], session_id=session_id)
+        executable = tool.get("status") == "implemented"
+        if executable:
+            mode, source = self.resolve_tool_policy(tool["name"], session_id=session_id)
+        else:
+            mode, source = "always_deny", "capability_boundary"
         return {
             "id": tool["name"],
             **dict(tool),
+            "executable": executable,
             "risk": "high" if tool["name"] in HIGH_RISK_TOOLS else "standard",
             "effective_policy": {
                 "mode": mode,
@@ -1357,6 +1404,13 @@ class Store:
             raise ValueError("scope is required")
         if mode not in {"always_allow", "always_ask", "always_deny"}:
             raise ValueError("mode must be always_allow, always_ask, or always_deny")
+        tool_definition = next((item for item in BUILTIN_TOOLS if item["name"] == scope), None)
+        if (
+            tool_definition
+            and tool_definition.get("status") != "implemented"
+            and mode != "always_deny"
+        ):
+            raise ValueError("reference-only tools can only be explicitly denied")
         policy_id = new_id("pol")
         timestamp = now_iso()
         with self._lock:
@@ -1442,9 +1496,12 @@ class Store:
             tool = tool_value
         if not tool:
             raise ValueError("tool is required")
-        known_tools = {item["name"] for item in BUILTIN_TOOLS}
-        if tool not in known_tools:
+        known_tools = {item["name"]: item for item in BUILTIN_TOOLS}
+        tool_definition = known_tools.get(tool)
+        if tool_definition is None:
             raise ValueError(f"unknown tool: {tool}")
+        if tool_definition.get("status") != "implemented":
+            raise ValueError(f"reference-only tool cannot be requested: {tool}")
         proposed_args = payload.get("args") or payload.get("proposed_args") or {}
         turn_id = payload.get("turn_id") or new_id("turn")
         mode, policy_source = self.resolve_tool_policy(tool, session_id=session_id)
@@ -1593,28 +1650,55 @@ class Store:
         return self.get_pending_action(action_id)
 
     def queue_tool_action(self, action: dict[str, Any], request_id: str, source: str) -> dict[str, Any]:
+        action = self.get_pending_action(action["id"])
         if action["status"] != "approved":
             raise ValueError("tool action must be approved before it can be queued")
-        run = self.create_run(
-            action["session_id"],
-            request_id,
-            trigger_source=f"tool:{action['tool']}",
-            job_id=None,
-            assign_worker=False,
-        )
-        self.append_event(
-            action["session_id"],
-            "tool.execution_queued",
-            {
-                "action_id": action["id"],
-                "tool": action["tool"],
-                "run_id": run["id"],
-                "source": source,
-            },
-            request_id,
-            turn_id=action["turn_id"],
-        )
-        self.audit("tool.execution_enqueue", "pending_action", action["id"], request_id)
+        run_id = action.get("execution_run_id")
+        if not run_id:
+            proposed_run_id = new_id("run")
+            with self._lock:
+                bound = self.conn.execute(
+                    """
+                    UPDATE pending_actions
+                    SET execution_run_id = ?, updated_at = ?
+                    WHERE id = ? AND status = 'approved' AND execution_run_id IS NULL
+                    """,
+                    (proposed_run_id, now_iso(), action["id"]),
+                ).rowcount
+                self.conn.commit()
+            action = self.get_pending_action(action["id"])
+            run_id = action.get("execution_run_id")
+            if not run_id:
+                raise ValueError("tool action is no longer queueable")
+
+        created_run = False
+        with self._lock:
+            try:
+                run = self.get_run(run_id)
+            except KeyError:
+                run = self.create_run(
+                    action["session_id"],
+                    request_id,
+                    trigger_source=f"tool:{action['tool']}",
+                    job_id=None,
+                    assign_worker=False,
+                    run_id=run_id,
+                )
+                created_run = True
+        if created_run:
+            self.append_event(
+                action["session_id"],
+                "tool.execution_queued",
+                {
+                    "action_id": action["id"],
+                    "tool": action["tool"],
+                    "run_id": run["id"],
+                    "source": source,
+                },
+                request_id,
+                turn_id=action["turn_id"],
+            )
+            self.audit("tool.execution_enqueue", "pending_action", action["id"], request_id)
         return {
             "type": "tool_execution_queued",
             "action": self.get_pending_action(action["id"]),
@@ -1649,19 +1733,23 @@ class Store:
         action = self.get_pending_action(action_id)
         if action["session_id"] != session_id:
             raise KeyError(action_id)
-        if action["status"] != "pending":
-            raise ValueError("pending action is already resolved")
         decision = payload.get("decision")
         if decision not in {"approve", "reject"}:
             raise ValueError("decision must be approve or reject")
+        if action["status"] != "pending":
+            if decision == "approve" and action["status"] == "approved":
+                if not action.get("execution_run_id"):
+                    self.queue_tool_action(action, request_id, source="approval_recovery")
+                return self.get_pending_action(action_id)
+            raise ValueError("pending action is already resolved")
         status = "approved" if decision == "approve" else "rejected"
         timestamp = now_iso()
         with self._lock:
-            self.conn.execute(
+            updated = self.conn.execute(
                 """
                 UPDATE pending_actions
                 SET status = ?, resolved_by = ?, resolved_at = ?, resolution_reason = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'pending'
                 """,
                 (
                     status,
@@ -1671,15 +1759,27 @@ class Store:
                     timestamp,
                     action_id,
                 ),
+            ).rowcount
+            if updated != 1:
+                self.conn.rollback()
+                raise ValueError("pending action is already resolved")
+            pending_count = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM pending_actions WHERE session_id = ? AND status = 'pending'",
+                    (session_id,),
+                ).fetchone()[0]
             )
-            self.conn.execute(
-                """
-                UPDATE sessions
-                SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
-                WHERE id = ?
-                """,
-                ("idle", "idle", timestamp, session_id),
-            )
+            if pending_count:
+                self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = 'waiting_approval', turn_status = 'waiting_approval', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (timestamp, session_id),
+                )
+            else:
+                self.refresh_session_run_state_locked(session_id, timestamp)
             self.conn.commit()
         self.audit("pending_action.resolve", "pending_action", action_id, request_id)
         self.append_event(
@@ -1714,6 +1814,8 @@ class Store:
             "resolved_by": row["resolved_by"],
             "resolved_at": row["resolved_at"],
             "reason": row["resolution_reason"],
+            "execution_run_id": row["execution_run_id"],
+            "execution_lease_generation": row["execution_lease_generation"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -1789,18 +1891,19 @@ class Store:
                 runtime_policy=self.runtime_policy_for_session(session_id),
             ),
         )
-        timestamp = now_iso()
-        with self._lock:
-            self.conn.execute(
-                """
-                UPDATE sessions
-                SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
-                WHERE id = ?
-                """,
-                ("idle", "idle", timestamp, session_id),
-            )
-            self.conn.commit()
-        self.append_event(session_id, "session.idle", {"turn_id": turn_id}, request_id, turn_id=turn_id)
+        if run_id is None:
+            timestamp = now_iso()
+            with self._lock:
+                self.conn.execute(
+                    """
+                    UPDATE sessions
+                    SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("idle", "idle", timestamp, session_id),
+                )
+                self.conn.commit()
+            self.append_event(session_id, "session.idle", {"turn_id": turn_id}, request_id, turn_id=turn_id)
         return {"turn_id": turn_id, "adapter": adapter_result}
 
     def run_noop_turn(self, session_id: str, source: str, request_id: str) -> None:
@@ -2016,6 +2119,48 @@ class Store:
             raise KeyError(job_id)
         return self.job_from_row(row)
 
+    def refresh_session_run_state_locked(
+        self,
+        session_id: str,
+        timestamp: str,
+        terminal_status: str = "idle",
+    ) -> None:
+        """Derive one session state from its durable run queue while holding ``_lock``."""
+        statuses = {
+            row["status"]
+            for row in self.conn.execute(
+                "SELECT status FROM job_runs WHERE session_id = ?", (session_id,)
+            ).fetchall()
+        }
+        has_pending_approval = bool(
+            self.conn.execute(
+                "SELECT 1 FROM pending_actions WHERE session_id = ? AND status = 'pending' LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        )
+        if "running" in statuses:
+            status = turn_status = "running"
+            clear_active_turn = False
+        elif has_pending_approval:
+            status = turn_status = "waiting_approval"
+            clear_active_turn = False
+        elif "queued" in statuses:
+            status = turn_status = "queued"
+            clear_active_turn = True
+        else:
+            status = turn_status = terminal_status
+            clear_active_turn = True
+        self.conn.execute(
+            """
+            UPDATE sessions
+            SET status = ?, turn_status = ?,
+                active_turn_id = CASE WHEN ? THEN NULL ELSE active_turn_id END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (status, turn_status, clear_active_turn, timestamp, session_id),
+        )
+
     def create_run(
         self,
         session_id: str,
@@ -2023,9 +2168,10 @@ class Store:
         trigger_source: str,
         job_id: str | None = None,
         assign_worker: bool = False,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         timestamp = now_iso()
-        run_id = new_id("run")
+        run_id = run_id or new_id("run")
         worker_id = None
         status = "queued"
         lease_expires_at = None
@@ -2102,15 +2248,7 @@ class Store:
                         """,
                         (timestamp, run_id),
                     )
-            if not worker_id:
-                self.conn.execute(
-                    """
-                    UPDATE sessions
-                    SET status = ?, turn_status = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    ("queued", "queued", timestamp, session_id),
-                )
+            self.refresh_session_run_state_locked(session_id, timestamp)
             self.conn.commit()
         self.audit("run.create", "run", run_id, request_id)
         run = self.get_run(run_id)
@@ -2153,9 +2291,19 @@ class Store:
                 raise ValueError("worker already has an active run")
             row = self.conn.execute(
                 """
-                SELECT * FROM job_runs
-                WHERE status = 'queued'
-                ORDER BY created_at
+                SELECT queued.* FROM job_runs AS queued
+                WHERE queued.status = 'queued'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM job_runs AS running
+                      WHERE running.session_id = queued.session_id
+                        AND running.status = 'running'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pending_actions AS pending
+                      WHERE pending.session_id = queued.session_id
+                        AND pending.status = 'pending'
+                  )
+                ORDER BY queued.created_at
                 LIMIT 1
                 """
             ).fetchone()
@@ -2254,6 +2402,14 @@ class Store:
             request_id,
             worker_id=worker_id,
             lease_token=lease_token,
+        )
+        self.append_worker_completion_event(
+            run["session_id"],
+            run_id,
+            worker_id,
+            final_status,
+            adapter_result["turn_id"],
+            request_id,
         )
         return {"type": "worker_run_execution", "run": completed, "adapter": adapter_result["adapter"]}
 
@@ -2457,38 +2613,86 @@ class Store:
             raise PermissionError("tool action does not belong to this run session")
         if run["trigger_source"] != f"tool:{action['tool']}":
             raise PermissionError("tool action is not assigned to this run")
+        if action.get("execution_run_id") != run_id:
+            raise PermissionError("tool action is not bound to this run")
         if action["status"] != "approved":
+            if action["status"] == "executing" and action.get("execution_run_id") == run_id:
+                raise ValueError("tool action is already executing")
             raise ValueError("tool action must be approved before worker execution")
         turn_id = payload.get("turn_id") or action["turn_id"] or self.get_session(run["session_id"]).get("active_turn_id")
-        self.append_event(
-            run["session_id"],
-            "tool.execution_started",
-            {"action_id": action_id, "tool": action["tool"], "run_id": run_id, "worker_id": worker_id},
-            request_id,
-            turn_id=turn_id,
-        )
-        result = self.execute_tool(
-            run["session_id"],
-            turn_id,
-            action["tool"],
-            action["proposed_args"],
-            request_id,
-            worker_id=worker_id,
-            run_id=run_id,
-        )
-        timestamp = now_iso()
+        with self._lock:
+            claimed = self.conn.execute(
+                """
+                UPDATE pending_actions
+                SET status = 'executing', execution_lease_generation = ?, updated_at = ?
+                WHERE id = ? AND status = 'approved' AND execution_run_id = ?
+                """,
+                (run["lease_generation"], now_iso(), action_id, run_id),
+            ).rowcount
+            self.conn.commit()
+        if claimed != 1:
+            current_action = self.get_pending_action(action_id)
+            if current_action["status"] == "executing":
+                raise ValueError("tool action is already executing")
+            raise ValueError("tool action is no longer executable")
+        try:
+            self.append_event(
+                run["session_id"],
+                "tool.execution_started",
+                {"action_id": action_id, "tool": action["tool"], "run_id": run_id, "worker_id": worker_id},
+                request_id,
+                turn_id=turn_id,
+            )
+            result = self.execute_tool(
+                run["session_id"],
+                turn_id,
+                action["tool"],
+                action["proposed_args"],
+                request_id,
+                worker_id=worker_id,
+                run_id=run_id,
+            )
+        except Exception:
+            failed_at = now_iso()
+            with self._lock:
+                self.conn.execute(
+                    """
+                    UPDATE pending_actions
+                    SET status = 'failed', execution_lease_generation = NULL, updated_at = ?
+                    WHERE id = ? AND status = 'executing' AND execution_run_id = ?
+                    """,
+                    (failed_at, action_id, run_id),
+                )
+                self.conn.commit()
+            self.audit("worker.tool_execute_failed", "pending_action", action_id, request_id)
+            self.append_event(
+                run["session_id"],
+                "tool.execution_failed",
+                {
+                    "action_id": action_id,
+                    "tool": action["tool"],
+                    "run_id": run_id,
+                    "worker_id": worker_id,
+                },
+                request_id,
+                severity="error",
+                turn_id=turn_id,
+            )
+            raise
+        completed_at = now_iso()
         with self._lock:
             updated = self.conn.execute(
                 """
                 UPDATE pending_actions
-                SET status = ?, updated_at = ?
-                WHERE id = ? AND status = 'approved'
+                SET status = 'executed', updated_at = ?
+                WHERE id = ? AND status = 'executing' AND execution_run_id = ?
+                  AND execution_lease_generation = ?
                 """,
-                ("executed", timestamp, action_id),
+                (completed_at, action_id, run_id, run["lease_generation"]),
             ).rowcount
             self.conn.commit()
         if updated != 1:
-            raise ValueError("tool action is no longer executable")
+            raise RuntimeError("tool action execution ownership was lost")
         self.audit("worker.tool_execute", "pending_action", action_id, request_id)
         self.append_event(
             run["session_id"],
@@ -2528,21 +2732,45 @@ class Store:
             worker_id=worker_id,
             lease_token=lease_token,
         )
-        if turn_id:
-            event_type = "session.idle" if status in {"succeeded", "canceled"} else "session.failed"
-            self.append_event(
-                run["session_id"],
-                event_type,
-                {"turn_id": turn_id, "run_id": run_id, "worker_id": worker_id},
-                request_id,
-                severity="error" if status == "failed" else "info",
-                turn_id=turn_id,
-            )
+        self.append_worker_completion_event(
+            run["session_id"], run_id, worker_id, status, turn_id, request_id
+        )
         return {
             "type": "worker_run_completion",
             "run": completed,
             "session": self.get_session(run["session_id"]),
         }
+
+    def append_worker_completion_event(
+        self,
+        session_id: str,
+        run_id: str,
+        worker_id: str,
+        run_status: str,
+        turn_id: str | None,
+        request_id: str,
+    ) -> None:
+        session = self.get_session(session_id)
+        if session["status"] == "idle":
+            event_type = "session.idle"
+        elif session["status"] == "failed":
+            event_type = "session.failed"
+        else:
+            event_type = "session.run_completed"
+        self.append_event(
+            session_id,
+            event_type,
+            {
+                "turn_id": turn_id,
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "run_status": run_status,
+                "session_status": session["status"],
+            },
+            request_id,
+            severity="error" if run_status == "failed" else "info",
+            turn_id=turn_id,
+        )
 
     def requeue_expired_runs(self, request_id: str) -> int:
         timestamp = now_iso()
@@ -2584,12 +2812,13 @@ class Store:
                     )
                 self.conn.execute(
                     """
-                    UPDATE sessions
-                    SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
-                    WHERE id = ?
+                    UPDATE pending_actions
+                    SET status = 'approved', execution_lease_generation = NULL, updated_at = ?
+                    WHERE execution_run_id = ? AND status = 'executing'
                     """,
-                    ("queued", "queued", timestamp, row["session_id"]),
+                    (timestamp, row["id"]),
                 )
+                self.refresh_session_run_state_locked(row["session_id"], timestamp)
                 self.conn.commit()
             self.audit("run.lease_expired", "run", row["id"], request_id)
             self.append_event(
@@ -2660,24 +2889,11 @@ class Store:
                     """,
                     (timestamp, run["worker_id"], run_id),
                 )
-            if status in {"succeeded", "canceled"}:
-                self.conn.execute(
-                    """
-                    UPDATE sessions
-                    SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    ("idle", "idle", timestamp, run["session_id"]),
-                )
-            elif status == "failed":
-                self.conn.execute(
-                    """
-                    UPDATE sessions
-                    SET status = ?, turn_status = ?, active_turn_id = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    ("failed", "failed", timestamp, run["session_id"]),
-                )
+            self.refresh_session_run_state_locked(
+                run["session_id"],
+                timestamp,
+                terminal_status="failed" if status == "failed" else "idle",
+            )
             self.conn.commit()
         self.audit("run.complete", "run", run_id, request_id)
         completed = self.get_run(run_id)
@@ -2878,16 +3094,25 @@ class Store:
             raise ValueError("provider is required")
         if provider not in {"feishu", "dify", "github_actions", "webhook"}:
             raise ValueError("provider must be feishu, dify, github_actions, or webhook")
+        self.validate_integration_base_url(payload.get("base_url"))
         timestamp = now_iso()
         integration_id = new_id("int")
         capabilities = integration_capabilities(provider)
         secret_material = payload.get("token") or payload.get("secret")
+        if secret_material is not None and not isinstance(secret_material, str):
+            raise ValueError("integration secret must be a string")
+        has_secret = bool(secret_material)
+        has_base_url = bool(payload.get("base_url"))
+        status = "configured" if has_base_url and has_secret else (
+            "credential_required" if has_base_url else "metadata_only"
+        )
+        credential_status = "registered" if has_secret else "registration_required"
         with self._lock:
             self.conn.execute(
                 """
                 INSERT INTO integrations
-                (id, tenant_id, project_id, provider, name, base_url, secret_ref, secret_material,
-                 status, capabilities, metadata, created_at, updated_at)
+                (id, tenant_id, project_id, provider, name, base_url, secret_ref,
+                 status, credential_status, capabilities, metadata, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -2898,16 +3123,59 @@ class Store:
                     payload.get("name") or provider,
                     payload.get("base_url"),
                     token_ref(secret_material),
-                    secret_material,
-                    "configured" if payload.get("base_url") and secret_material else "metadata_only",
+                    status,
+                    credential_status,
                     json_dumps(capabilities),
                     json_dumps(payload.get("metadata", {})),
                     timestamp,
                     timestamp,
                 ),
             )
+            if has_secret:
+                self._integration_secrets[integration_id] = secret_material
             self.conn.commit()
         self.audit("integration.create", "integration", integration_id, request_id)
+        return self.get_integration(integration_id)
+
+    @staticmethod
+    def validate_integration_base_url(base_url: Any) -> None:
+        if base_url is None or base_url == "":
+            return
+        if not isinstance(base_url, str):
+            raise ValueError("integration base_url must be a string")
+        parsed = urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("integration base_url must be an absolute http or https URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("integration base_url must not include userinfo")
+
+    def register_integration_credential(
+        self,
+        integration_id: str,
+        payload: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        secret = payload.get("secret")
+        if not isinstance(secret, str) or not secret:
+            raise ValueError("secret is required")
+        integration = self.get_integration(integration_id)
+        if not integration.get("base_url"):
+            raise ValueError("integration base_url is required before registering a credential")
+        timestamp = now_iso()
+        with self._lock:
+            updated = self.conn.execute(
+                """
+                UPDATE integrations
+                SET secret_ref = ?, status = 'configured', credential_status = 'registered', updated_at = ?
+                WHERE id = ?
+                """,
+                (token_ref(secret), timestamp, integration_id),
+            ).rowcount
+            if updated != 1:
+                raise KeyError(integration_id)
+            self._integration_secrets[integration_id] = secret
+            self.conn.commit()
+        self.audit("integration.credential.register", "integration", integration_id, request_id)
         return self.get_integration(integration_id)
 
     def list_integrations(self) -> list[dict[str, Any]]:
@@ -2921,12 +3189,12 @@ class Store:
         return self.integration_from_row(row)
 
     def get_integration_secret_material(self, integration_id: str) -> str | None:
-        row = self.fetch_one("SELECT secret_material FROM integrations WHERE id = ?", (integration_id,))
-        if row is None:
-            raise KeyError(integration_id)
-        return row["secret_material"]
+        self.get_integration(integration_id)
+        return self._integration_secrets.get(integration_id)
 
     def integration_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        credential_registered = row["id"] in self._integration_secrets
+        has_base_url = bool(row["base_url"])
         return {
             "id": row["id"],
             "type": "integration",
@@ -2936,7 +3204,10 @@ class Store:
             "name": row["name"],
             "base_url": row["base_url"],
             "secret_ref": row["secret_ref"],
-            "status": row["status"],
+            "status": "configured" if has_base_url and credential_registered else (
+                "credential_required" if has_base_url else "metadata_only"
+            ),
+            "credential_status": "registered" if credential_registered else "registration_required",
             "capabilities": json_loads(row["capabilities"], {}),
             "metadata": json_loads(row["metadata"], {}),
             "created_at": row["created_at"],
@@ -3004,6 +3275,7 @@ class Store:
         base_url = integration.get("base_url")
         if not base_url:
             raise ValueError("integration base_url is required")
+        self.validate_integration_base_url(base_url)
         token = self.get_integration_secret_material(integration["id"])
         if not token:
             raise PermissionError("integration token is not configured")
@@ -3046,43 +3318,14 @@ class Store:
         }
 
     def overview(self) -> dict[str, Any]:
-        counts: dict[str, int] = {}
-        for table in [
-            "agents",
-            "environments",
-            "sessions",
-            "events",
-            "jobs",
-            "job_runs",
-            "workers",
-            "files",
-            "artifacts",
-            "tool_policies",
-            "pending_actions",
-            "usage_records",
-            "vaults",
-            "vault_credentials",
-            "integrations",
-        ]:
-            row = self.fetch_one(f"SELECT COUNT(*) AS count FROM {table}", ())
-            counts[table] = int(row["count"]) if row else 0
-        return {
-            "type": "cloudagent.admin.overview",
-            "service": "CloudAgent-Platform",
-            "version": __version__,
-            "counts": counts,
-            "permission_profiles": self.list_permission_profiles(),
-            "sandbox_profiles": self.list_sandbox_profiles(),
-            "tools": self.list_tools(),
-            "recent_sessions": self.list_sessions()[:5],
-            "recent_jobs": self.list_jobs()[:5],
-            "recent_runs": self.list_runs()[:5],
-            "recent_artifacts": self.list_artifacts()[:5],
-            "vaults": self.list_vaults()[:5],
-            "pending_actions": self.list_pending_actions()[:5],
-            "workers": self.list_workers(),
-            "integrations": self.list_integrations(),
-        }
+        from .showcase import ShowcaseService
+
+        return ShowcaseService(self).overview()
+
+    def bootstrap_showcase(self, request_id: str) -> dict[str, Any]:
+        from .showcase import ShowcaseService
+
+        return ShowcaseService(self).bootstrap(request_id)
 
 
 
@@ -3116,8 +3359,11 @@ def run_server(
     print(f"CloudAgent-Platform listening on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        print("CloudAgent-Platform stopped.", flush=True)
     finally:
         runtime.stop()
+        server.server_close()
     return server
 
 

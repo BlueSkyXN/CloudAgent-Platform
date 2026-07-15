@@ -286,14 +286,14 @@ class LocalPrototypeTest(unittest.TestCase):
         self.assertEqual(pending["data"][0]["tool"], "artifact.create")
         self.assertEqual(pending["data"][0]["status"], "pending")
 
-        status, policy = self.request(
+        status, policy_error = self.request(
             "POST",
             "/api/v1/tool-policies",
             {"scope": "external.http", "mode": "always_allow"},
         )
-        self.assertEqual(status, 201)
-        self.assertIsInstance(policy, dict)
-        status, denied = self.request(
+        self.assertEqual(status, 400)
+        self.assertIsInstance(policy_error, dict)
+        status, unavailable = self.request(
             "POST",
             f"/api/v1/sessions/{session['id']}/events",
             {
@@ -304,17 +304,17 @@ class LocalPrototypeTest(unittest.TestCase):
                 },
             },
         )
-        self.assertEqual(status, 201)
-        self.assertIsInstance(denied, dict)
-        self.assertEqual(denied["payload"]["policy_mode"], "always_deny")
-        self.assertEqual(denied["payload"]["policy_source"], "environment")
-        self.assertEqual(denied["payload"]["evaluated_permission"], "deny")
+        self.assertEqual(status, 400)
+        self.assertIsInstance(unavailable, dict)
 
         status, tools = self.request("GET", "/api/v1/tools")
         self.assertEqual(status, 200)
         self.assertIsInstance(tools, dict)
         external_http = next(item for item in tools["data"] if item["name"] == "external.http")
-        self.assertEqual(external_http["effective_policy"]["decision"], "allow")
+        self.assertEqual(external_http["status"], "reference_only")
+        self.assertFalse(external_http["executable"])
+        self.assertEqual(external_http["effective_policy"]["decision"], "deny")
+        self.assertEqual(external_http["effective_policy"]["source"], "capability_boundary")
         self.assertEqual(external_http["risk"], "high")
 
     def test_admin_does_not_embed_default_token_and_body_limit(self) -> None:
@@ -1178,7 +1178,9 @@ class LocalPrototypeTest(unittest.TestCase):
         status, tools = self.request("GET", "/api/v1/tools")
         self.assertEqual(status, 200)
         self.assertIsInstance(tools, dict)
-        self.assertIn("external.http", [tool["name"] for tool in tools["data"]])
+        external_http = next(tool for tool in tools["data"] if tool["name"] == "external.http")
+        self.assertEqual(external_http["status"], "reference_only")
+        self.assertFalse(external_http["executable"])
 
         status, requested = self.request(
             "POST",
@@ -1191,13 +1193,30 @@ class LocalPrototypeTest(unittest.TestCase):
                 },
             },
         )
+        self.assertEqual(status, 400)
+        self.assertIsInstance(requested, dict)
+
+        status, _ = self.request(
+            "POST",
+            "/api/v1/tool-policies",
+            {"scope": "file.read", "mode": "always_ask"},
+        )
+        self.assertEqual(status, 201)
+        status, requested = self.request(
+            "POST",
+            f"/api/v1/sessions/{session['id']}/events",
+            {
+                "type": "tool.requested",
+                "payload": {"tool": "file.read", "args": {"file_id": "file_not_used"}},
+            },
+        )
         self.assertEqual(status, 201)
         self.assertIsInstance(requested, dict)
 
         status, pending = self.request("GET", f"/api/v1/sessions/{session['id']}/pending-actions")
         self.assertEqual(status, 200)
         self.assertIsInstance(pending, dict)
-        self.assertEqual(pending["data"][0]["tool"], "external.http")
+        self.assertEqual(pending["data"][0]["tool"], "file.read")
         self.assertEqual(pending["data"][0]["status"], "pending")
 
         action_id = pending["data"][0]["id"]

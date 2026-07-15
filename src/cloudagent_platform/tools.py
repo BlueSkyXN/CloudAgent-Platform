@@ -15,6 +15,7 @@ BUILTIN_TOOLS = [
     {
         "name": "artifact.create",
         "source": "platform",
+        "status": "implemented",
         "description": "Create a session artifact from tool arguments.",
         "default_policy": "always_allow",
         "schema": {
@@ -26,20 +27,23 @@ BUILTIN_TOOLS = [
     {
         "name": "file.read",
         "source": "platform",
-        "description": "Read metadata or content for an uploaded file.",
+        "status": "implemented",
+        "description": "Read metadata for an uploaded file.",
         "default_policy": "always_allow",
         "schema": {"type": "object", "properties": {"file_id": {"type": "string"}}},
     },
     {
         "name": "external.http",
         "source": "platform",
-        "description": "Placeholder for outbound HTTP calls; requires approval in P0.",
+        "status": "reference_only",
+        "description": "Reserved vocabulary for a future governed HTTP adapter; not executable in this release.",
         "default_policy": "always_ask",
         "schema": {"type": "object", "properties": {"url": {"type": "string"}, "method": {"type": "string"}}},
     },
     {
         "name": "integration.dify.chat",
         "source": "connector",
+        "status": "implemented",
         "description": "Send a Dify chat message through a configured Dify integration.",
         "default_policy": "always_ask",
         "schema": {
@@ -58,6 +62,7 @@ BUILTIN_TOOLS = [
     {
         "name": "integration.feishu.message",
         "source": "connector",
+        "status": "implemented",
         "description": "Send a Feishu message through a configured Feishu integration.",
         "default_policy": "always_ask",
         "schema": {
@@ -75,7 +80,8 @@ BUILTIN_TOOLS = [
     {
         "name": "shell.exec",
         "source": "platform",
-        "description": "Placeholder for shell execution; requires approval in P0.",
+        "status": "reference_only",
+        "description": "Reserved vocabulary for a future governed shell adapter; not executable in this release.",
         "default_policy": "always_ask",
         "schema": {"type": "object", "properties": {"command": {"type": "string"}}},
     },
