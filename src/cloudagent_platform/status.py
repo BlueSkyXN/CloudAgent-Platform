@@ -4,7 +4,7 @@ from __future__ import annotations
 def sdlc_status_payload() -> dict[str, object]:
     return {
         "type": "cloudagent.sdlc.status",
-        "status": "showcase-release-candidate",
+        "status": "company-showcase-release",
         "generated_package": "local/20260616",
         "implemented_scope": "governed-local-control-plane-and-showcase-console",
         "runtime_capabilities": {
