@@ -25,6 +25,13 @@ Runtime contract:
 - `/_ops/healthz`, `/_ops/readyz`, and `/openapi.json` are public operational
   surfaces.
 - `/api/v1/*` application routes keep the runtime bearer-token boundary.
+- Runtime releases at `0.2.0` or later expose the package-owned operator
+  Console at `/admin` with same-origin CSS/JS/SVG assets. The Console does not
+  embed the Space secret and still requires the runtime Bearer token.
+
+Deployment truth is read from both the Space wrapper SHA and the mounted
+bucket's `RUNTIME_MANIFEST.json.git_sha`; a `RUNNING` Space alone does not prove
+that the mounted runtime matches GitHub `main`.
 
 ## HFS Contract
 
@@ -39,6 +46,13 @@ Runtime contract:
 
 ```bash
 bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space
+```
+
+Local release candidates also simulate the read-only runtime mount and start
+the real package through the wrapper before any publish decision:
+
+```bash
+bash cloud/hfs/smoke_mounted_runtime.sh
 ```
 
 ## Source

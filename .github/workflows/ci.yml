@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Compile Python sources
+        run: python -m py_compile src/cloudagent_platform/*.py tests/*.py
+
+      - name: Run unit and integration tests
+        env:
+          PYTHONPATH: src
+          PYTHONWARNINGS: error::ResourceWarning
+        run: python -m unittest discover -s tests
+
+      - name: Validate console JavaScript
+        run: node --check src/cloudagent_platform/web/console.js
+
+      - name: Build wheel without dependencies
+        run: |
+          python -m pip wheel . --no-deps --wheel-dir /tmp/cloudagent-wheel
+          wheel_path="$(find /tmp/cloudagent-wheel -type f -name '*.whl' -print -quit)"
+          test -n "${wheel_path}"
+          python -m zipfile -e "${wheel_path}" /tmp/cloudagent-wheel-unpack
+          test -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/console.py
+          test -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/showcase.py
+          test -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/web/index.html
+          test -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/web/console.css
+          test -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/web/console.js
+          test -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/web/mark.svg
+          test ! -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/admin.py
+          python -m pip install --no-deps --no-compile --target /tmp/cloudagent-wheel-site "${wheel_path}"
+          PYTHONPATH=/tmp/cloudagent-wheel-site python - <<'PY'
+          from cloudagent_platform import __version__
+          from cloudagent_platform.console import get_console_asset
+          from cloudagent_platform.openapi import current_openapi
+
+          assert __version__ == "0.2.0"
+          assert current_openapi()["info"]["version"] == __version__
+          asset = get_console_asset("/admin/assets/console.js")
+          assert asset is not None and len(asset.content) > 1_000
+          PY
+
+      - name: Validate HFS wrapper export
+        run: |
+          bash -n cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/start.sh cloud/hfs/smoke_mounted_runtime.sh
+          bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space
+
+      - name: Smoke-test mounted HFS runtime
+        run: bash cloud/hfs/smoke_mounted_runtime.sh
+
+      - name: Check whitespace
+        run: git show --check --oneline --decorate --no-renames HEAD

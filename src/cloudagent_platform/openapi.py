@@ -4,11 +4,29 @@ from . import __version__
 
 
 def current_openapi() -> dict[str, object]:
+    public_json_response = {
+        "200": {
+            "description": "Public operational response",
+            "content": {"application/json": {"schema": {"type": "object"}}},
+        }
+    }
     paths = {
-        "/_ops/healthz": {"get": {"summary": "Health check"}},
-        "/_ops/readyz": {"get": {"summary": "Readiness check"}},
-        "/openapi.json": {"get": {"summary": "Current implemented OpenAPI document"}},
-        "/api/v1/sdlc/status": {"get": {"summary": "Local SDLC/runtime status"}},
+        "/_ops/healthz": {
+            "get": {"summary": "Health check", "security": [], "responses": public_json_response}
+        },
+        "/_ops/readyz": {
+            "get": {"summary": "Readiness check", "security": [], "responses": public_json_response}
+        },
+        "/openapi.json": {
+            "get": {
+                "summary": "Current implemented OpenAPI document",
+                "security": [],
+                "responses": public_json_response,
+            }
+        },
+        "/api/v1/sdlc/status": {
+            "get": {"summary": "Local SDLC/runtime status", "security": [], "responses": public_json_response}
+        },
         "/api/v1/system/info": {"get": {"summary": "System information"}},
         "/api/v1/permission-profiles": {"get": {"summary": "List permission profiles"}},
         "/api/v1/permission-profiles/{profile_id}": {"get": {"summary": "Get permission profile"}},
@@ -74,22 +92,131 @@ def current_openapi() -> dict[str, object]:
             "post": {"summary": "Create integration"},
         },
         "/api/v1/integrations/{integration_id}": {"get": {"summary": "Get integration"}},
+        "/api/v1/integrations/{integration_id}/credential": {
+            "post": {
+                "summary": "Register or replace a process-local integration credential",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/IntegrationCredentialRequest"}
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "Redacted integration with credential status configured",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Integration"}
+                            }
+                        },
+                    },
+                    "400": {"$ref": "#/components/responses/InvalidRequest"},
+                    "401": {"$ref": "#/components/responses/AuthenticationError"},
+                    "404": {"$ref": "#/components/responses/NotFound"},
+                },
+            }
+        },
         "/api/v1/vaults": {"get": {"summary": "List vaults"}, "post": {"summary": "Create vault"}},
         "/api/v1/vaults/{vault_id}": {"get": {"summary": "Get vault"}},
         "/api/v1/vaults/{vault_id}/credentials": {
             "get": {"summary": "List vault credentials"},
-            "post": {"summary": "Create vault credential"},
+            "post": {
+                "summary": "Create write-only vault credential reference",
+                "responses": {
+                    "201": {
+                        "description": "Redacted vault credential",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/VaultCredential"}
+                            }
+                        },
+                    }
+                },
+            },
         },
         "/api/v1/webhooks/{provider}/{integration_id}": {
-            "post": {"summary": "Accept signed webhook trigger asynchronously"}
+            "post": {
+                "summary": "Accept signed webhook trigger asynchronously",
+                "security": [{"WebhookToken": []}],
+                "responses": {
+                    "202": {"description": "Webhook accepted"},
+                    "400": {"$ref": "#/components/responses/InvalidRequest"},
+                    "401": {"$ref": "#/components/responses/AuthenticationError"},
+                },
+            }
         },
         "/api/v1/files": {"get": {"summary": "List files"}, "post": {"summary": "Create JSON-backed file"}},
         "/api/v1/files/{file_id}": {"get": {"summary": "Get file metadata"}},
         "/api/v1/files/{file_id}/content": {"get": {"summary": "Download file content"}},
+        "/api/v1/artifacts": {
+            "get": {
+                "summary": "List artifacts across sessions",
+                "responses": {
+                    "200": {
+                        "description": "Artifact list",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ListResponse"}
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/v1/artifacts/{artifact_id}": {
+            "get": {
+                "summary": "Get artifact metadata",
+                "responses": {
+                    "200": {
+                        "description": "Artifact metadata",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Artifact"}
+                            }
+                        },
+                    },
+                    "404": {"$ref": "#/components/responses/NotFound"},
+                },
+            }
+        },
+        "/api/v1/artifacts/{artifact_id}/content": {
+            "get": {
+                "summary": "Download artifact content",
+                "responses": {
+                    "200": {
+                        "description": "Raw artifact bytes",
+                        "content": {
+                            "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+                        },
+                    },
+                    "404": {"$ref": "#/components/responses/NotFound"},
+                },
+            }
+        },
         "/api/v1/tools": {"get": {"summary": "List built-in tools"}},
-        "/api/v1/tool-policies": {"post": {"summary": "Create tool policy"}},
+        "/api/v1/tool-policies": {
+            "get": {"summary": "List tool policies"},
+            "post": {"summary": "Create tool policy"},
+        },
         "/api/v1/tool-policies/{policy_id}": {"get": {"summary": "Get tool policy"}},
         "/api/v1/admin/overview": {"get": {"summary": "Admin overview"}},
+        "/api/v1/admin/showcase/bootstrap": {
+            "post": {
+                "summary": "Idempotently create local showcase resources",
+                "responses": {
+                    "200": {
+                        "description": "Local showcase resources and whether each was created or reused.",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ShowcaseBootstrapResponse"}
+                            }
+                        },
+                    }
+                },
+            }
+        },
     }
     return {
         "openapi": "3.1.0",
@@ -105,6 +232,26 @@ def current_openapi() -> dict[str, object]:
             "securitySchemes": {
                 "BearerAuth": {"type": "http", "scheme": "bearer"},
                 "WebhookToken": {"type": "apiKey", "in": "header", "name": "X-CloudAgent-Webhook-Token"},
+            },
+            "responses": {
+                "InvalidRequest": {
+                    "description": "Invalid request",
+                    "content": {
+                        "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+                    },
+                },
+                "AuthenticationError": {
+                    "description": "Authentication or webhook token failure",
+                    "content": {
+                        "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+                    },
+                },
+                "NotFound": {
+                    "description": "Resource not found",
+                    "content": {
+                        "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+                    },
+                },
             },
             "schemas": {
                 "Error": {
@@ -168,9 +315,27 @@ def current_openapi() -> dict[str, object]:
                 "Worker": {"type": "object", "required": ["id", "type", "name", "status", "capabilities", "active_run_id"]},
                 "Integration": {
                     "type": "object",
-                    "required": ["id", "type", "provider", "name", "status", "capabilities"],
+                    "required": [
+                        "id", "type", "provider", "name", "status", "credential_status", "capabilities"
+                    ],
                     "properties": {
-                        "secret_ref": {"type": ["string", "null"], "description": "Digest reference only; raw secret values are never returned."}
+                        "secret_ref": {"type": ["string", "null"], "description": "Digest reference only; raw secret values are never returned or persisted."},
+                        "credential_status": {
+                            "type": "string",
+                            "enum": ["registered", "registration_required"],
+                            "description": "Registered means this process currently holds a write-only credential in memory."
+                        },
+                    },
+                },
+                "IntegrationCredentialRequest": {
+                    "type": "object",
+                    "required": ["secret"],
+                    "properties": {
+                        "secret": {
+                            "type": "string",
+                            "writeOnly": True,
+                            "description": "Stored only in the running process; never returned or persisted in SQLite."
+                        }
                     },
                 },
                 "Vault": {
@@ -196,7 +361,18 @@ def current_openapi() -> dict[str, object]:
                         },
                     },
                 },
-                "Tool": {"type": "object", "required": ["id", "name", "source", "default_policy", "schema"]},
+                "Tool": {
+                    "type": "object",
+                    "required": [
+                        "id",
+                        "name",
+                        "source",
+                        "status",
+                        "executable",
+                        "default_policy",
+                        "schema",
+                    ],
+                },
                 "ToolPolicy": {"type": "object", "required": ["id", "scope", "mode"]},
                 "PendingAction": {"type": "object", "required": ["id", "session_id", "tool", "proposed_args", "status"]},
                 "Artifact": {"type": "object", "required": ["id", "type", "session_id", "name", "content_ref"]},
@@ -213,6 +389,31 @@ def current_openapi() -> dict[str, object]:
                         "lease_token": {"type": "string"},
                         "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
                         "result": {"type": "object"},
+                    },
+                },
+                "ShowcaseBootstrapResponse": {
+                    "type": "object",
+                    "required": [
+                        "type",
+                        "agent",
+                        "environment",
+                        "session",
+                        "job",
+                        "worker",
+                        "run",
+                        "created",
+                        "reused",
+                    ],
+                    "properties": {
+                        "type": {"type": "string", "const": "cloudagent.admin.showcase_bootstrap"},
+                        "agent": {"$ref": "#/components/schemas/Agent"},
+                        "environment": {"$ref": "#/components/schemas/Environment"},
+                        "session": {"$ref": "#/components/schemas/Session"},
+                        "job": {"$ref": "#/components/schemas/Job"},
+                        "worker": {"$ref": "#/components/schemas/Worker"},
+                        "run": {"$ref": "#/components/schemas/JobRun"},
+                        "created": {"type": "array", "items": {"type": "string"}},
+                        "reused": {"type": "array", "items": {"type": "string"}},
                     },
                 },
             },

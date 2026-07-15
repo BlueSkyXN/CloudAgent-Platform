@@ -1,7 +1,9 @@
 {
   "schema_version": 1,
-  "mode": "deployment-probe",
+  "mode": "bucket-mounted-runtime",
   "source_path": "cloud/hfs",
   "generated_at": "source-tree-placeholder",
+  "runtime_bucket": "BlueSkyXN/cloudagent-platform-hfs-runtime",
+  "runtime_mount": "/mnt/cloudagent-runtime",
   "files": []
 }

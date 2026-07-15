@@ -1,108 +1,227 @@
 # CloudAgent-Platform
 
-CloudAgent-Platform is being built as an API-first cloud Agent cluster platform:
-programmable scheduling, long-running session/event handling, external
-integrations, and an admin control surface.
+CloudAgent-Platform is an API-first control plane for governed Agent execution.
+It combines scheduling, session/event handling, worker leases, runtime policy,
+tool approvals, artifacts, usage evidence, Vault references, and a responsive
+operator console in one dependency-free Python service.
 
-Current repository state:
+The current release line is a **company-showcase candidate for the local
+runtime**. It is designed to demonstrate a complete, honest execution loop; it
+does not claim production multi-tenant isolation, a hardened remote worker
+fleet, or runtime secret injection.
 
-- `src/cloudagent_platform/` contains a dependency-free local runtime prototype with P0.5 module boundaries for config, utilities, OpenAPI, scheduler, HTTP routing, tool registry, and connector metadata.
-- `cloud/hfs/` contains the Hugging Face Docker Space deployment wrapper.
-- `local/20260616/` contains the SDLC package and target OpenAPI draft; the implemented local contract is served by `/openapi.json` from code.
+## What the Showcase Proves
 
-## Local Prototype
+The console and API operate on the same persisted SQLite state. There are no
+mock cards or decorative actions in the main workflow:
 
-Run the standard-library service:
+1. Create or bootstrap governed Agent, Environment, Session, Job, and Worker
+   resources.
+2. Queue work through the Job `Queue run` action or a `user.message` Session
+   event.
+3. Claim the run with a lease-scoped Worker.
+4. Execute the local adapter or an exact approval-bound tool action under the
+   selected permission, sandbox, and Tool Policy.
+5. Inspect ordered events, downloadable artifacts, usage, approval reasons,
+   and correlated audit evidence.
 
-```bash
-PYTHONPATH=src CLOUDAGENT_AUTH_TOKEN=dev-local-token python3 -m cloudagent_platform --port 8080
+The console's signature `Runtime Rail` exposes that path as live state:
+
+```text
+API Gateway -> Policy -> Queue -> Worker -> Artifact / Audit evidence
 ```
 
-Run one external HTTP worker pass against the local service:
+## Run Locally
+
+Start the standard-library service:
 
 ```bash
-PYTHONPATH=src cloudagent-worker \
+PYTHONPATH=src \
+  CLOUDAGENT_AUTH_TOKEN=dev-local-token \
+  python3 -m cloudagent_platform --port 8080
+```
+
+Open the operator console at <http://127.0.0.1:8080/admin> and enter the same
+Bearer token. The token is retained only in browser `sessionStorage`; it is not
+embedded in the page, URL, API output, or persisted application data.
+
+Useful endpoints:
+
+- Console: <http://127.0.0.1:8080/admin>
+- Health: <http://127.0.0.1:8080/_ops/healthz>
+- Readiness: <http://127.0.0.1:8080/_ops/readyz>
+- Implemented OpenAPI: <http://127.0.0.1:8080/openapi.json>
+- Runtime/SDLC boundary: <http://127.0.0.1:8080/api/v1/sdlc/status>
+
+Protected endpoints expect:
+
+```http
+Authorization: Bearer dev-local-token
+```
+
+The default development token is accepted only for localhost binding. A
+non-loopback bind requires `CLOUDAGENT_AUTH_TOKEN` or `--auth-token`.
+
+### Fast Showcase Flow
+
+1. Connect with the local token.
+2. Select **Initialize showcase** on an empty workspace. The bootstrap API is
+   idempotent and reuses the marked resources on subsequent calls.
+3. Open **Runtime** and process the bootstrap run with the registered showcase
+   Worker. Use **Queue run** when you want another Job execution.
+4. Open **Governance** to review effective permission/sandbox/tool policy. To
+   demonstrate an approval, create an `artifact.create` policy with
+   `always_ask`.
+5. Open **Sessions**, submit an `artifact.create` request with JSON arguments,
+   review the proposed arguments, approve it with a reason, then return to
+   **Runtime** and process the exact queued tool run.
+6. Reopen the Session to inspect the timeline, usage and audit correlation, or
+   download its artifact from the drawer or **Resources**.
+
+## Architecture
+
+```text
+Web Console / API clients
+          |
+          v
+HTTP + auth + OpenAPI + SSE
+          |
+          +---- ShowcaseService read model / idempotent bootstrap
+          |
+          v
+SQLite control plane + ordered Event Store + Audit / Usage
+          |
+          v
+Run queue + lease-scoped Worker API
+          |
+          v
+Runtime Adapter -> Sandbox Provider -> Tool Gateway -> Artifact evidence
+```
+
+Important boundaries:
+
+- The Web Console consumes protected HTTP APIs; it does not read SQLite or
+  bypass worker lease and policy checks.
+- `ShowcaseService` composes operator-facing readiness/activity data without
+  moving execution into the control plane.
+- Session events are durable runtime truth; SSE is a replay/transport surface.
+- A Session may queue multiple runs, but only one run per Session can be
+  claimed at a time. This serialization is enforced inside the local Store
+  process and is not presented as distributed coordination.
+- Kernel-specific behavior stays behind Runtime Adapter contracts.
+- Environment policy is fail-closed: request payloads cannot weaken the chosen
+  permission or sandbox profile.
+- Approved tool actions are bound to one exact run and lease generation before
+  execution. Concurrent replay cannot enter the connector twice in the local
+  process.
+- Vault credentials are write-only references. The prototype stores redacted
+  metadata and `secret_ref` digests, then discards submitted plaintext.
+- Integration credentials are also never persisted as plaintext. They live
+  only in current-process memory, so a restarted service reports
+  `credential_required` and requires explicit re-registration.
+- Dify/Feishu calls are approval- and lease-gated control-plane connectors.
+  Provider-specific idempotency is not implemented: an ambiguous remote
+  failure is recorded as `failed` and is never replayed automatically.
+
+## Implemented Surfaces
+
+### Control plane and runtime
+
+- Agent, Environment, Session, ordered Event Store, SSE replay, Jobs, Runs, and
+  Workers.
+- Worker claim, lease generation/token validation, lease renewal, worker-side
+  turn start, event/artifact/usage writeback, tool execution, and completion.
+- `LocalPrototypeAdapter` with a fixed `LocalSubprocessSandboxProvider` that
+  uses a temporary workspace, avoids shell expansion, emits policy/sandbox/
+  kernel events, records evidence, and removes the workspace after the turn.
+- Probe-only `CodexCliProbeAdapter` that reports `codex --version` availability
+  without executing prompts, tools, edits, or shell tasks.
+
+### Governance and resources
+
+- Built-in `read-only`, `workspace-write`, and `network-limited` Permission
+  Profiles. `danger-full-access` is visible for vocabulary parity but blocked.
+- Implemented local subprocess sandbox plus planned/reference profiles that are
+  clearly labeled and cannot create Environments.
+- Tool Gateway decisions (`allow`, `ask`, `deny`), pending approvals, and
+  worker-scoped approved execution bound to a specific queued run.
+- Reference-only tool vocabulary is fail-closed: it is labeled as unavailable,
+  cannot be enabled by policy, and cannot create an action or queued run.
+- JSON/text Files, authenticated Artifact content downloads, Usage records,
+  managed Integrations, process-memory Integration credential registration,
+  and write-only Vault credential registration.
+
+### Operator experience
+
+- Authenticated access gate with no default token embedded in the page.
+- Overview with live readiness, runtime rail, signals, activity, and capability
+  boundaries.
+- Runtime, Sessions, Governance, and Resources workspaces with functional
+  create, queue, claim/execute, tool request/approval, file and artifact
+  download, and evidence inspection flows.
+- Loading, empty, disabled, success, and persistent form-error states;
+  responsive layout; modal focus trapping and restoration; reduced-motion
+  support; strict static-asset CSP.
+
+## Capability Boundary
+
+| Capability | Current state |
+|---|---|
+| Local control plane and SQLite event/audit evidence | Implemented |
+| Local worker and lease-scoped execution loop | Implemented |
+| Company-showcase Web Console | Implemented |
+| Permission and sandbox policy contracts | Implemented for local provider |
+| Connector records and gated Dify/Feishu tool calls | Implemented local flow |
+| Integration credential persistence | Process memory only; re-register after restart |
+| Vault plaintext persistence | Prohibited |
+| Vault runtime secret injection | Not implemented |
+| Production-grade sandbox isolation | Not implemented |
+| Hardened distributed worker fleet / multi-tenant HA | Not implemented |
+
+## External Worker
+
+Run one worker pass against the service:
+
+```bash
+PYTHONPATH=src python3 -m cloudagent_platform.worker \
   --base-url http://127.0.0.1:8080 \
   --token dev-local-token \
   --worker-id worker_local_http \
   --once
 ```
 
-Then open:
+The browser showcase uses the compatibility `/execute` path for adapter runs
+and the worker-scoped `/tools/execute` path for approval-bound tool runs. It
+keeps the returned `lease_token` only in the current JavaScript call. The
+standalone worker remains the preferred demonstration of the
+control-plane/execution-plane boundary.
 
-- Admin panel: <http://127.0.0.1:8080/admin>
-- Health: <http://127.0.0.1:8080/_ops/healthz>
-- Readiness: <http://127.0.0.1:8080/_ops/readyz>
-- Current implemented OpenAPI: <http://127.0.0.1:8080/openapi.json>
+## Validation
 
-Protected API endpoints expect:
+Run the release-candidate gate:
 
-```http
-Authorization: Bearer dev-local-token
+```bash
+python3 -m py_compile src/cloudagent_platform/*.py tests/*.py
+PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests
+node --check src/cloudagent_platform/web/console.js
+python3 -m pip wheel . --no-deps --wheel-dir /tmp/cloudagent-wheel
+bash -n cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/start.sh cloud/hfs/smoke_mounted_runtime.sh
+bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space
+bash cloud/hfs/smoke_mounted_runtime.sh
+git diff --check
 ```
 
-The prototype intentionally keeps Feishu, Dify, GitHub Actions, and webhook
-integrations as managed connector records first. Secret material is stored only
-for local development execution and is not returned by read APIs. Dify chat and
-Feishu message calls are available only through the Tool Gateway flow: approval,
-queued `tool:*` run, worker claim, current `lease_token`, and worker-scoped
-`/tools/execute`. Broader connector surfaces remain future work.
+CI repeats the Python matrix, JavaScript syntax, wheel, HFS wrapper export, and
+mounted-runtime startup smoke checks on pushes to `main` and pull requests.
 
-The default development token is accepted only for localhost binding. If the
-service is bound to a non-localhost host, set `CLOUDAGENT_AUTH_TOKEN` or pass
-`--auth-token` explicitly. The admin page no longer embeds a default token or
-worker run lease tokens.
+## Deployment
 
-Implemented local runtime surfaces include:
+`cloud/hfs/` is the Hugging Face Docker Space wrapper. It is deployment
+packaging rather than product source, exports a flat safe Space root, and starts
+the runtime from the mounted runtime bucket. Publishing a new showcase build
+still requires an explicit runtime-bucket sync and live Space readback; local
+completion alone is not deployment proof.
 
-- Agent, Environment, Session, ordered Event Store, and SSE replay.
-- Built-in Permission Profiles and Sandbox Profiles, exposed through
-  `/api/v1/permission-profiles` and `/api/v1/sandbox-profiles`. Environment
-  records now persist `permission_profile_id`, `sandbox_profile_id`,
-  package policy, and per-environment tool policy defaults. The profile
-  vocabulary includes `read-only`, `workspace-write`, and `network-limited`;
-  `danger-full-access` is intentionally visible but blocked for environment
-  creation in this prototype. Only implemented sandbox profiles can create
-  environments; planned/reference sandbox profiles stay visible as roadmap
-  contracts but are blocked until the provider exists.
-- Workers, Jobs, Runs, signed integration webhooks, scheduler delay triggers, and
-  session user-event turns. Job triggers, scheduler delay triggers, signed
-  integration webhooks, and `user.*` session events create queued runs and return
-  before adapter execution. `/api/v1/jobs/{job_id}/enqueue` remains an explicit
-  queueing alias for worker `claim` and worker-side execution.
-- A dependency-free `cloudagent-worker` CLI that registers over HTTP, claims a
-  queued run, starts a turn, executes the local prototype adapter in the worker
-  process, writes events/artifacts/usage back through worker-scoped API
-  endpoints, and exits or loops. Each claim returns a `lease_token` and
-  `lease_generation`; worker-side writeback and the legacy `/execute` path must
-  present the current token, so stale workers cannot complete a run after lease
-  expiry and re-claim. During worker-local execution, the CLI renews the active
-  run lease through `/api/v1/workers/{worker_id}/runs/{run_id}/lease/renew`.
-  A legacy `--server-execute` flag still calls the server-side `/execute` path
-  for compatibility. This is a local prototype worker client, not a hardened
-  remote fleet yet.
-- A `LocalPrototypeAdapter` runtime boundary backed by a fixed
-  `LocalSubprocessSandboxProvider`. It emits `kernel.*`, `sandbox.*`,
-  `runtime.policy_applied`, `worker.*`, artifact, usage, and audit-correlated
-  events, creates a temporary workspace, runs a controlled Python subprocess
-  without shell expansion, and deletes the workspace after the turn. Worker-side
-  `/turn/start` returns the effective runtime policy so the worker and control
-  plane report the same sandbox/permission contract.
-- A probe-only `CodexCliProbeAdapter` kernel entry at `codex-cli-probe`. It
-  locates `codex`, runs `codex --version`, and reports availability without
-  executing prompts, tools, file edits, or shell commands.
-- Minimal Tool Gateway policy flow with `always_allow`, `always_ask`, approval
-  resolve, worker-scoped approved action execution, and audit events. Control
-  plane requests record/approve/queue tool actions; workers execute approved
-  actions through lease-checked worker endpoints. `/api/v1/tools` returns an
-  effective policy matrix with `allow` / `ask` / `deny` decisions and policy
-  source for each built-in tool. The current connector-backed built-ins cover
-  `integration.dify.chat` and `integration.feishu.message`.
-- Minimal Vault API for write-only credential registration. `/api/v1/vaults`
-  and `/api/v1/vaults/{vault_id}/credentials` retain only redacted auth
-  metadata and `secret_ref` digests; plaintext credential material is discarded
-  after the request. Sessions can bind `vault_ids`, and runtime policy events
-  report the bound IDs and count. Runtime secret injection remains disabled
-  until a KMS or broker-backed provider is implemented.
-- JSON-backed local Files, session Artifacts, and placeholder Usage records for
-  completed turns.
+`local/20260616/` contains the SDLC, threat model, data model, validation plan,
+roadmap, and deployment records. The implemented API contract is always the
+document served by `/openapi.json` from the current code.
