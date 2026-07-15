@@ -15,6 +15,7 @@ from cloudagent_platform.http import make_handler
 from cloudagent_platform.openapi import current_openapi
 from cloudagent_platform.scheduler import Runtime
 from cloudagent_platform.showcase import ShowcaseService
+from cloudagent_platform.status import sdlc_status_payload
 
 
 class BackendHardeningTest(unittest.TestCase):
@@ -323,6 +324,7 @@ class BackendHardeningTest(unittest.TestCase):
 
     def test_auth_and_openapi_security_contracts(self) -> None:
         openapi = current_openapi()
+        self.assertEqual(sdlc_status_payload()["status"], "company-showcase-release")
         for path in ("/_ops/healthz", "/_ops/readyz", "/openapi.json", "/api/v1/sdlc/status"):
             self.assertEqual(openapi["paths"][path]["get"]["security"], [])
         webhook = openapi["paths"]["/api/v1/webhooks/{provider}/{integration_id}"]["post"]
