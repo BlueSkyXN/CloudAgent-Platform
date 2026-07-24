@@ -146,6 +146,29 @@ class ShowcaseApiTest(unittest.TestCase):
         self.assertTrue(overview["activity"]["items"])
         self.assertNotIn("lease_token", json.dumps(overview))
 
+        session_id = first["session"]["id"]
+        status, workspace, _ = self.request(
+            "GET", f"/api/v1/admin/sessions/{session_id}/workspace"
+        )
+        self.assertEqual(status, 200)
+        self.assertIsInstance(workspace, dict)
+        self.assertEqual(workspace["type"], "cloudagent.admin.session_workspace")
+        self.assertEqual(workspace["session"]["id"], session_id)
+        self.assertEqual(workspace["last_event_id"], workspace["events"][-1]["id"])
+        self.assertEqual(workspace["counts"]["events"], len(workspace["events"]))
+        self.assertEqual(
+            workspace["counts"]["audit_records"], len(workspace["audit"])
+        )
+        self.assertTrue(workspace["tools"])
+        self.assertNotIn("lease_token", json.dumps(workspace))
+
+        status, missing_workspace, _ = self.request(
+            "GET", "/api/v1/admin/sessions/sess_missing/workspace"
+        )
+        self.assertEqual(status, 404)
+        self.assertIsInstance(missing_workspace, dict)
+        self.assertEqual(missing_workspace["error"]["type"], "not_found_error")
+
         status, artifacts, _ = self.request("GET", "/api/v1/artifacts")
         self.assertEqual(status, 200)
         self.assertIsInstance(artifacts, dict)

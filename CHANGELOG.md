@@ -24,6 +24,14 @@ All notable changes to CloudAgent-Platform are documented here.
 - Corrected the Console Integration workflow so inbound Webhook credentials can
   be registered without an outbound base URL; outbound providers still require
   their base URL.
+- Rebuilt the Console around the Calm Precision semantic palette, typography,
+  spacing, flat information hierarchy, accessible focus treatment, 44px mobile
+  targets, 16px mobile form controls, and interruptible reduced-motion states.
+- Added shareable URL state for every Console workspace and selected Session,
+  including browser Back/Forward restoration and session-scoped draft recovery.
+- Added a typed admin Session workspace read model so the Console can load the
+  Session, timeline, approvals, evidence, usage, audit, and available tools with
+  one authenticated request instead of six independent collection reads.
 
 ## 0.2.0 - 2026-07-15
 

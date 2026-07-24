@@ -298,6 +298,21 @@ def current_openapi() -> dict[str, object]:
         },
         "/api/v1/tool-policies/{policy_id}": {"get": {"summary": "Get tool policy"}},
         "/api/v1/admin/overview": {"get": {"summary": "Admin overview"}},
+        "/api/v1/admin/sessions/{session_id}/workspace": {
+            "get": {
+                "summary": "Get the complete Console session workspace read model",
+                "responses": {
+                    "200": {
+                        "description": "Session, timeline, approvals, evidence, usage, audit, and tools",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/SessionWorkspace"}
+                            }
+                        },
+                    }
+                },
+            }
+        },
         "/api/v1/admin/showcase/bootstrap": {
             "post": {
                 "summary": "Idempotently create local showcase resources",
@@ -486,6 +501,51 @@ def current_openapi() -> dict[str, object]:
                         "lease_token": {"type": "string"},
                         "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
                         "result": {"type": "object"},
+                    },
+                },
+                "SessionWorkspace": {
+                    "type": "object",
+                    "required": [
+                        "type",
+                        "session",
+                        "events",
+                        "artifacts",
+                        "usage",
+                        "pending_actions",
+                        "audit",
+                        "tools",
+                        "counts",
+                        "last_event_id",
+                    ],
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "const": "cloudagent.admin.session_workspace",
+                        },
+                        "session": {"$ref": "#/components/schemas/Session"},
+                        "events": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/Event"},
+                        },
+                        "artifacts": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/Artifact"},
+                        },
+                        "usage": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/UsageRecord"},
+                        },
+                        "pending_actions": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/PendingAction"},
+                        },
+                        "audit": {"type": "array", "items": {"type": "object"}},
+                        "tools": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/Tool"},
+                        },
+                        "counts": {"type": "object"},
+                        "last_event_id": {"type": ["string", "null"]},
                     },
                 },
                 "ShowcaseBootstrapResponse": {

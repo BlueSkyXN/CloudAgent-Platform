@@ -523,6 +523,20 @@ class Store:
             self.conn.commit()
         return audit_id
 
+    def list_session_audit(self, session_id: str) -> list[dict[str, Any]]:
+        self.get_session(session_id)
+        rows = self.fetch_all(
+            """
+            SELECT * FROM audit_log
+            WHERE target_id = ? OR id IN (
+                SELECT audit_ref FROM events WHERE session_id = ? AND audit_ref IS NOT NULL
+            )
+            ORDER BY created_at DESC
+            """,
+            (session_id, session_id),
+        )
+        return [dict(row) for row in rows]
+
     def fetch_one(self, query: str, args: tuple[Any, ...]) -> sqlite3.Row | None:
         with self._lock:
             return self.conn.execute(query, args).fetchone()
@@ -3529,6 +3543,11 @@ class Store:
         from .showcase import ShowcaseService
 
         return ShowcaseService(self).overview()
+
+    def session_workspace(self, session_id: str) -> dict[str, Any]:
+        from .showcase import ShowcaseService
+
+        return ShowcaseService(self).session_workspace(session_id)
 
     def bootstrap_showcase(self, request_id: str) -> dict[str, Any]:
         from .showcase import ShowcaseService

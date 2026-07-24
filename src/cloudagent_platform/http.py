@@ -533,6 +533,17 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                 if method == "GET" and path == "/api/v1/admin/overview":
                     self.respond_json(HTTPStatus.OK, runtime.store.overview())
                     return
+                if (
+                    method == "GET"
+                    and len(parts) == 6
+                    and parts[:4] == ["api", "v1", "admin", "sessions"]
+                    and parts[5] == "workspace"
+                ):
+                    self.respond_json(
+                        HTTPStatus.OK,
+                        runtime.store.session_workspace(parts[4]),
+                    )
+                    return
                 if method == "POST" and path == "/api/v1/admin/showcase/bootstrap":
                     self.respond_json(
                         HTTPStatus.OK,
@@ -576,17 +587,7 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
             return value
 
         def audit_for_session(self, session_id: str) -> list[dict[str, Any]]:
-            rows = runtime.store.fetch_all(
-                """
-                SELECT * FROM audit_log
-                WHERE target_id = ? OR id IN (
-                    SELECT audit_ref FROM events WHERE session_id = ? AND audit_ref IS NOT NULL
-                )
-                ORDER BY created_at DESC
-                """,
-                (session_id, session_id),
-            )
-            return [dict(row) for row in rows]
+            return runtime.store.list_session_audit(session_id)
 
         def respond_sse(self, session_id: str, query: dict[str, list[str]]) -> None:
             after_id = query.get("after_id", [None])[0] or self.headers.get("Last-Event-ID")

@@ -71,6 +71,15 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
                 "application/octet-stream",
                 spec["paths"][path]["get"]["responses"]["200"]["content"],
             )
+        session_workspace = spec["paths"][
+            "/api/v1/admin/sessions/{session_id}/workspace"
+        ]["get"]
+        self.assertEqual(
+            session_workspace["responses"]["200"]["content"]["application/json"][
+                "schema"
+            ]["$ref"],
+            "#/components/schemas/SessionWorkspace",
+        )
 
     def test_local_references_resolve(self) -> None:
         spec = current_openapi()
