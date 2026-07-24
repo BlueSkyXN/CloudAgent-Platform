@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import socket
 import sqlite3
 import tempfile
 import threading
 import unittest
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from cloudagent_platform.app import Store
+from cloudagent_platform.errors import ConnectorRequestError
 from cloudagent_platform.http import make_handler
 from cloudagent_platform.openapi import current_openapi
 from cloudagent_platform.scheduler import Runtime
@@ -216,7 +219,62 @@ class BackendHardeningTest(unittest.TestCase):
             self.store.get_pending_action(concurrent_action["id"])["execution_run_id"], queued_runs[0]
         )
 
-    def test_tool_failure_is_terminal_but_lease_requeue_recovers_same_bound_action(self) -> None:
+    def test_tool_run_cannot_bypass_bound_action_through_generic_worker_paths(self) -> None:
+        session = self.create_session()
+        action = self.store.create_pending_action(
+            session["id"],
+            "turn_no_bypass",
+            "artifact.create",
+            {"name": "protected.txt", "content": "ok"},
+            "test",
+            status="approved",
+            wait_for_approval=False,
+        )
+        queued = self.store.queue_tool_action(action, "test", source="test")
+        self.store.register_worker({"id": "worker-no-bypass", "name": "No bypass worker"}, "test")
+        claim = self.store.claim_next_run("worker-no-bypass", "test", lease_seconds=60)
+        lease_token = claim["run"]["lease_token"]
+
+        with self.assertRaisesRegex(ValueError, "tools/execute"):
+            self.store.start_worker_run_turn("worker-no-bypass", queued["run"]["id"], lease_token, "test")
+        with self.assertRaisesRegex(ValueError, "tools/execute"):
+            self.store.execute_claimed_run("worker-no-bypass", queued["run"]["id"], lease_token, "test")
+        with self.assertRaisesRegex(ValueError, "matching terminal state"):
+            self.store.complete_worker_run(
+                "worker-no-bypass",
+                queued["run"]["id"],
+                {"lease_token": lease_token, "status": "succeeded", "result": {}},
+                "test",
+            )
+
+        self.assertEqual(self.store.get_pending_action(action["id"])["status"], "approved")
+        self.assertEqual(self.store.get_run(queued["run"]["id"])["status"], "running")
+
+    def test_orphaned_tool_binding_is_recovered_by_creating_its_bound_run(self) -> None:
+        session = self.create_session()
+        action = self.store.create_pending_action(
+            session["id"], "turn_orphan", "artifact.create", {"name": "orphan.txt", "content": "ok"}, "test",
+            status="approved", wait_for_approval=False,
+        )
+        orphan_run_id = "run_orphan_binding"
+        with self.store._lock:
+            self.store.conn.execute(
+                "UPDATE pending_actions SET execution_run_id = ? WHERE id = ?", (orphan_run_id, action["id"])
+            )
+            self.store.conn.commit()
+
+        recovered = self.store.resolve_pending_action(
+            session["id"], action["id"], {"decision": "approve"}, "test"
+        )
+        self.assertEqual(recovered["execution_run_id"], orphan_run_id)
+        self.assertEqual(self.store.get_run(orphan_run_id)["trigger_source"], "tool:artifact.create")
+        self.assertEqual(self.store.get_pending_action(action["id"])["execution_run_id"], orphan_run_id)
+        self.assertIn(
+            "tool.execution_queued",
+            [event["type"] for event in self.store.list_events(session["id"])],
+        )
+
+    def test_inflight_tool_lease_expiry_fails_without_replaying_side_effect(self) -> None:
         session = self.create_session()
         action = self.store.create_pending_action(
             session["id"], "turn_test", "artifact.create", {"name": "output.txt", "content": "ok"}, "test",
@@ -225,35 +283,267 @@ class BackendHardeningTest(unittest.TestCase):
         queued = self.store.queue_tool_action(action, "test", source="test")
         self.store.register_worker({"id": "worker-failure", "name": "Failure worker"}, "test")
         claim = self.store.claim_next_run("worker-failure", "test", lease_seconds=60)
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[str] = []
         original_execute = self.store.execute_tool
 
-        def fail_execute(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise RuntimeError("connector failed")
+        def slow_execute(*_args: object, **_kwargs: object) -> dict[str, object]:
+            calls.append("side-effect")
+            entered.set()
+            release.wait(timeout=2)
+            return {"ok": True}
 
-        self.store.execute_tool = fail_execute  # type: ignore[method-assign]
-        with self.assertRaisesRegex(RuntimeError, "connector failed"):
-            self.store.execute_worker_run_tool(
-                "worker-failure", claim["run"]["id"],
-                {"lease_token": claim["run"]["lease_token"], "action_id": action["id"]}, "test"
-            )
-        self.store.execute_tool = original_execute  # type: ignore[method-assign]
-        self.assertEqual(self.store.get_pending_action(action["id"])["status"], "failed")
+        self.store.execute_tool = slow_execute  # type: ignore[method-assign]
+        outcomes: list[BaseException | dict[str, object]] = []
 
-        # A lease expiry—not a tool exception—is the explicit retry path for the same run/action.
+        def execute_once() -> None:
+            try:
+                outcomes.append(
+                    self.store.execute_worker_run_tool(
+                        "worker-failure", queued["run"]["id"],
+                        {"lease_token": claim["run"]["lease_token"], "action_id": action["id"]}, "test"
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcomes.append(exc)
+
+        execution = threading.Thread(target=execute_once)
+        execution.start()
+        self.assertTrue(entered.wait(timeout=2))
         with self.store._lock:
-            self.store.conn.execute(
-                "UPDATE pending_actions SET status = 'executing' WHERE id = ?", (action["id"],)
-            )
             self.store.conn.execute(
                 "UPDATE job_runs SET lease_expires_at = ? WHERE id = ?",
                 ("2000-01-01T00:00:00+00:00", queued["run"]["id"]),
             )
             self.store.conn.commit()
-        self.store.requeue_expired_runs("test")
-        recovered = self.store.get_pending_action(action["id"])
-        self.assertEqual(recovered["status"], "approved")
-        self.assertEqual(recovered["execution_run_id"], queued["run"]["id"])
-        self.assertIsNone(recovered["execution_lease_generation"])
+        self.assertEqual(self.store.requeue_expired_runs("test"), 1)
+        release.set()
+        execution.join(timeout=2)
+        self.store.execute_tool = original_execute  # type: ignore[method-assign]
+
+        self.assertEqual(calls, ["side-effect"])
+        self.assertEqual(self.store.get_pending_action(action["id"])["status"], "failed")
+        self.assertEqual(self.store.get_run(queued["run"]["id"])["status"], "failed")
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], RuntimeError)
+
+    def test_expired_tool_run_with_terminal_action_is_converged_not_requeued(self) -> None:
+        for action_status, expected_run_status in (("executed", "succeeded"), ("failed", "failed"), ("rejected", "failed")):
+            with self.subTest(action_status=action_status):
+                session = self.create_session()
+                action = self.store.create_pending_action(
+                    session["id"], f"turn_{action_status}", "artifact.create", {"name": "output.txt", "content": "ok"}, "test",
+                    status="approved", wait_for_approval=False,
+                )
+                queued = self.store.queue_tool_action(action, "test", source="test")
+                worker_id = f"worker-terminal-{action_status}"
+                self.store.register_worker({"id": worker_id, "name": "Terminal worker"}, "test")
+                claim = self.store.claim_next_run(worker_id, "test", lease_seconds=60)
+                with self.store._lock:
+                    self.store.conn.execute(
+                        "UPDATE pending_actions SET status = ?, execution_lease_generation = NULL WHERE id = ?",
+                        (action_status, action["id"]),
+                    )
+                    self.store.conn.execute(
+                        "UPDATE job_runs SET lease_expires_at = ? WHERE id = ?",
+                        ("2000-01-01T00:00:00+00:00", claim["run"]["id"]),
+                    )
+                    self.store.conn.commit()
+
+                self.assertEqual(self.store.requeue_expired_runs("test"), 1)
+                self.assertEqual(self.store.get_run(queued["run"]["id"])["status"], expected_run_status)
+                self.assertEqual(self.store.get_pending_action(action["id"])["status"], action_status)
+
+    def test_expired_tool_run_without_a_bound_action_fails_closed(self) -> None:
+        session = self.create_session()
+        action = self.store.create_pending_action(
+            session["id"], "turn_missing_action", "artifact.create", {"name": "output.txt", "content": "ok"}, "test",
+            status="approved", wait_for_approval=False,
+        )
+        queued = self.store.queue_tool_action(action, "test", source="test")
+        self.store.register_worker({"id": "worker-missing-action", "name": "Missing action worker"}, "test")
+        claim = self.store.claim_next_run("worker-missing-action", "test", lease_seconds=60)
+        with self.store._lock:
+            self.store.conn.execute("DELETE FROM pending_actions WHERE id = ?", (action["id"],))
+            self.store.conn.execute(
+                "UPDATE job_runs SET lease_expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", claim["run"]["id"]),
+            )
+            self.store.conn.commit()
+
+        self.assertEqual(self.store.requeue_expired_runs("test"), 1)
+        self.assertEqual(self.store.get_run(queued["run"]["id"])["status"], "failed")
+        event = next(
+            item for item in self.store.list_events(session["id"]) if item["type"] == "worker.lease_expired"
+        )
+        self.assertEqual(event["payload"]["recovery_action"], "invalid_tool_run_failed")
+
+    def test_connector_failures_and_target_controls_are_fail_closed(self) -> None:
+        requests: list[dict[str, object]] = []
+        redirected_requests: list[dict[str, object]] = []
+
+        class DestinationHandler(BaseHTTPRequestHandler):
+            def record(self) -> None:
+                redirected_requests.append(
+                    {"method": self.command, "authorization": self.headers.get("Authorization")}
+                )
+                self.send_response(200)
+                self.end_headers()
+
+            do_POST = record
+            do_GET = record
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        destination = ThreadingHTTPServer(("127.0.0.1", 0), DestinationHandler)
+        destination_thread = threading.Thread(target=destination.serve_forever, daemon=True)
+        destination_thread.start()
+
+        class ConnectorHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                requests.append({"path": self.path, "authorization": self.headers.get("Authorization")})
+                if self.path == "/redirect/chat-messages":
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{destination.server_port}/received")
+                    body = b'{"error":"redirect"}'
+                elif self.path == "/oversized/chat-messages":
+                    self.send_response(200)
+                    body = b"x" * 64
+                elif self.path == "/fallback/chat-messages":
+                    self.send_response(200)
+                    body = b'{"ok":true}'
+                else:
+                    self.send_response(500)
+                    body = b'{"error":"upstream failure"}'
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        connector = ThreadingHTTPServer(("127.0.0.1", 0), ConnectorHandler)
+        connector_thread = threading.Thread(target=connector.serve_forever, daemon=True)
+        connector_thread.start()
+        try:
+            unsafe_store = Store(str(Path(self.tmp.name) / "unsafe-connectors.sqlite3"), allow_unsafe_connector_urls_for_tests=True)
+            self.addCleanup(unsafe_store.close)
+            integration = unsafe_store.create_integration(
+                {"provider": "dify", "name": "Failure connector", "base_url": f"http://127.0.0.1:{connector.server_port}", "secret": "connector-secret"},
+                "test",
+            )
+            with self.assertRaises(ConnectorRequestError) as failure:
+                unsafe_store.invoke_dify_chat({"integration_id": integration["id"], "query": "hello"})
+            self.assertEqual(
+                failure.exception.status_code,
+                500,
+                msg=f"cause={failure.exception.__cause__!r} summary={failure.exception.response_summary!r}",
+            )
+            self.assertNotIn("connector-secret", str(failure.exception))
+
+            agent = unsafe_store.create_agent({"name": "Connector failure agent"}, "test")
+            session = unsafe_store.create_session(
+                {"agent_id": agent["id"], "environment_id": unsafe_store.list_environments()[0]["id"]}, "test"
+            )
+            action = unsafe_store.create_pending_action(
+                session["id"],
+                "turn_connector_failure",
+                "integration.dify.chat",
+                {"integration_id": integration["id"], "query": "worker failure"},
+                "test",
+                status="approved",
+                wait_for_approval=False,
+            )
+            queued = unsafe_store.queue_tool_action(action, "test", source="test")
+            unsafe_store.register_worker({"id": "worker-http-500", "name": "HTTP failure worker"}, "test")
+            claim = unsafe_store.claim_next_run("worker-http-500", "test", lease_seconds=60)
+            with self.assertRaises(ConnectorRequestError):
+                unsafe_store.execute_worker_run_tool(
+                    "worker-http-500",
+                    queued["run"]["id"],
+                    {"lease_token": claim["run"]["lease_token"], "action_id": action["id"]},
+                    "test",
+                )
+            self.assertEqual(unsafe_store.get_pending_action(action["id"])["status"], "failed")
+            self.assertNotEqual(unsafe_store.get_pending_action(action["id"])["status"], "executed")
+            self.assertEqual(unsafe_store.get_run(queued["run"]["id"])["status"], "failed")
+
+            redirect = unsafe_store.create_integration(
+                {"provider": "dify", "name": "Redirect connector", "base_url": f"http://127.0.0.1:{connector.server_port}/redirect", "secret": "redirect-secret"},
+                "test",
+            )
+            with self.assertRaises(ConnectorRequestError) as redirect_failure:
+                unsafe_store.invoke_dify_chat({"integration_id": redirect["id"], "query": "hello"})
+            self.assertEqual(redirect_failure.exception.status_code, 302)
+            self.assertEqual(redirected_requests, [])
+
+            tiny_store = Store(
+                str(Path(self.tmp.name) / "tiny-connectors.sqlite3"),
+                max_content_bytes=32,
+                allow_unsafe_connector_urls_for_tests=True,
+            )
+            self.addCleanup(tiny_store.close)
+            oversized = tiny_store.create_integration(
+                {"provider": "dify", "name": "Oversized connector", "base_url": f"http://127.0.0.1:{connector.server_port}/oversized", "secret": "oversized-secret"},
+                "test",
+            )
+            with self.assertRaises(ConnectorRequestError) as oversized_failure:
+                tiny_store.invoke_dify_chat({"integration_id": oversized["id"], "query": "hello"})
+            self.assertEqual(oversized_failure.exception.status_code, 200)
+            self.assertEqual(oversized_failure.exception.response_summary, "response body exceeds maximum size")
+
+            original_getaddrinfo = socket.getaddrinfo
+
+            def fallback_getaddrinfo(host: str, port: int, *args: object, **kwargs: object) -> object:
+                if host == "fallback.example":
+                    return [
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.2", port)),
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+                    ]
+                return original_getaddrinfo(host, port, *args, **kwargs)
+
+            fallback = unsafe_store.create_integration(
+                {"provider": "dify", "name": "Fallback connector", "base_url": f"http://fallback.example:{connector.server_port}/fallback", "secret": "fallback-secret"},
+                "test",
+            )
+            with patch("cloudagent_platform.app.socket.getaddrinfo", side_effect=fallback_getaddrinfo):
+                fallback_result = unsafe_store.invoke_dify_chat({"integration_id": fallback["id"], "query": "hello"})
+            self.assertTrue(fallback_result["ok"])
+
+            safe_store = Store(str(Path(self.tmp.name) / "safe-connectors.sqlite3"))
+            self.addCleanup(safe_store.close)
+            blocked = safe_store.create_integration(
+                {"provider": "dify", "name": "Blocked connector", "base_url": f"http://127.0.0.1:{connector.server_port}", "secret": "blocked-secret"},
+                "test",
+            )
+            with self.assertRaisesRegex(ValueError, "restricted"):
+                safe_store.invoke_dify_chat({"integration_id": blocked["id"], "query": "hello"})
+            with patch(
+                "cloudagent_platform.app.socket.getaddrinfo",
+                return_value=[
+                    (2, 1, 6, "", ("93.184.216.34", 443)),
+                    (2, 1, 6, "", ("10.0.0.8", 443)),
+                ],
+            ):
+                with self.assertRaisesRegex(ValueError, "restricted"):
+                    safe_store.resolve_connector_target("https://mixed-address.example")
+            self.assertEqual(len(requests), 5)
+        finally:
+            connector.shutdown()
+            connector_thread.join(timeout=2)
+            connector.server_close()
+            destination.shutdown()
+            destination_thread.join(timeout=2)
+            destination.server_close()
+
+    def test_webhook_credential_can_be_registered_without_outbound_base_url(self) -> None:
+        webhook = self.store.create_integration({"provider": "webhook", "name": "Inbound webhook"}, "test")
+        self.assertEqual(webhook["status"], "credential_required")
+        registered = self.store.register_integration_credential(webhook["id"], {"secret": "inbound-secret"}, "test")
+        self.assertEqual(registered["status"], "configured")
+        self.assertEqual(registered["credential_status"], "registered")
 
     def test_integration_secret_is_memory_only_and_reregisterable(self) -> None:
         integration = self.store.create_integration(

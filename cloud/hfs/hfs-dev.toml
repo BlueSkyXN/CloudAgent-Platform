@@ -8,7 +8,7 @@ export_command = "bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform
 public_port = 7860
 canonical_health_endpoint = "/_ops/healthz"
 readiness_endpoint = "/_ops/readyz"
-release_pin_required = false
+release_pin_required = true
 required_files = [
   "README.md",
   "Dockerfile",

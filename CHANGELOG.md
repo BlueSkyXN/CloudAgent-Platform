@@ -2,6 +2,29 @@
 
 All notable changes to CloudAgent-Platform are documented here.
 
+## Unreleased
+
+### Changed
+
+- Made approval-to-run binding transactional and recoverable, and made expired
+  tool leases converge fail-closed instead of replaying an ambiguous external
+  side effect.
+- Made Connector failures terminate both the action and its bound run, blocked
+  generic worker execution/completion from bypassing the tool state machine,
+  and added DNS-pinned public-address validation, redirect refusal, redacted
+  upstream errors, and a 1 MiB response limit.
+- Added OpenAPI route-contract validation for path parameters, operation IDs,
+  local references, and success/error responses.
+- Made the HFS runtime release pin immutable: Space startup now validates the
+  selected release ID, version, Git SHA, and every manifest file hash before
+  launching the application.
+- Added a clean-tree runtime snapshot builder and made dirty Space exports fail
+  by default. Explicit dirty overrides are marked non-release provenance and
+  cannot be started as a pinned release.
+- Corrected the Console Integration workflow so inbound Webhook credentials can
+  be registered without an outbound base URL; outbound providers still require
+  their base URL.
+
 ## 0.2.0 - 2026-07-15
 
 ### Added

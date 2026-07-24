@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/cloudagent-hfs-smoke.XXXXXX")"
 server_pid=""
+snapshot_worktree=""
 startup_timeout_seconds="${CLOUDAGENT_SMOKE_STARTUP_TIMEOUT_SECONDS:-60}"
 
 cleanup() {
@@ -27,6 +28,9 @@ cleanup() {
       printf 'Mounted runtime did not stop after 5s; forcing termination.\n' >&2
     fi
   fi
+  if [[ -n "${snapshot_worktree}" ]]; then
+    git -C "${repo_root}" worktree remove --force "${snapshot_worktree}" >/dev/null 2>&1 || true
+  fi
   rm -rf "${tmp_dir}"
 }
 trap cleanup EXIT
@@ -43,7 +47,47 @@ PY
 export PORT="${port}"
 export CLOUDAGENT_AUTH_TOKEN="mounted-runtime-smoke-token"
 export CLOUDAGENT_DB="${tmp_dir}/cloudagent-platform.sqlite3"
-export CLOUDAGENT_RUNTIME_ROOT="${repo_root}"
+export CLOUDAGENT_VERIFIED_RUNTIME_ROOT="${tmp_dir}/verified-runtime"
+runtime_version="$(PYTHONPATH="${repo_root}/src" python3 -c 'from cloudagent_platform import __version__; print(__version__)')"
+runtime_git_sha="$(git -C "${repo_root}" rev-parse --verify HEAD)"
+runtime_release="v${runtime_version}-${runtime_git_sha}"
+export CLOUDAGENT_RUNTIME_ROOT="${tmp_dir}/runtime"
+export CLOUDAGENT_RUNTIME_RELEASE="${runtime_release}"
+export CLOUDAGENT_RUNTIME_VERSION="${runtime_version}"
+export CLOUDAGENT_RUNTIME_GIT_SHA="${runtime_git_sha}"
+
+runtime_dir="${CLOUDAGENT_RUNTIME_ROOT}/releases/${CLOUDAGENT_RUNTIME_RELEASE}"
+snapshot_worktree="${tmp_dir}/snapshot-source"
+git -C "${repo_root}" worktree add --detach "${snapshot_worktree}" HEAD >/dev/null
+
+build_runtime_snapshot() {
+  rm -rf "${runtime_dir}"
+  CLOUDAGENT_REPO_ROOT="${snapshot_worktree}" \
+    bash "${repo_root}/cloud/hfs/build_runtime_snapshot.sh" "${CLOUDAGENT_RUNTIME_ROOT}" "${CLOUDAGENT_RUNTIME_RELEASE}" >/dev/null
+}
+
+expect_start_reject() {
+  local label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf 'expected start.sh to reject %s\n' "${label}" >&2
+    exit 1
+  fi
+}
+
+build_runtime_snapshot
+expect_start_reject "wrong pinned git SHA" env CLOUDAGENT_RUNTIME_GIT_SHA="$(printf '0%.0s' {1..40})" bash "${repo_root}/cloud/hfs/start.sh"
+expect_start_reject "wrong pinned version" env CLOUDAGENT_RUNTIME_VERSION="0.0.0" bash "${repo_root}/cloud/hfs/start.sh"
+printf '\n# smoke corruption\n' >> "${runtime_dir}/src/cloudagent_platform/app.py"
+expect_start_reject "runtime manifest hash mismatch" bash "${repo_root}/cloud/hfs/start.sh"
+build_runtime_snapshot
+printf 'print("not listed")\n' > "${runtime_dir}/src/cloudagent_platform/unlisted_runtime_file.py"
+expect_start_reject "runtime manifest inventory mismatch" bash "${repo_root}/cloud/hfs/start.sh"
+rm "${runtime_dir}/src/cloudagent_platform/unlisted_runtime_file.py"
+ln -s app.py "${runtime_dir}/src/cloudagent_platform/runtime_symlink.py"
+expect_start_reject "runtime symlink" bash "${repo_root}/cloud/hfs/start.sh"
+rm "${runtime_dir}/src/cloudagent_platform/runtime_symlink.py"
+build_runtime_snapshot
 
 bash "${repo_root}/cloud/hfs/start.sh" >"${tmp_dir}/server.log" 2>&1 &
 server_pid="$!"

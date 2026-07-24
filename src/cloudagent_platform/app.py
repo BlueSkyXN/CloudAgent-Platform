@@ -3,8 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import http.client
+import ipaddress
 import json
 import os
+import socket
+import ssl
 import sqlite3
 import threading
 import time
@@ -13,9 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
-from urllib.request import Request, urlopen
 
 from .config import (
     DEFAULT_MAX_JSON_BYTES,
@@ -27,7 +29,7 @@ from .config import (
     SCHEMA_VERSION,
 )
 from .connectors import integration_capabilities
-from .errors import PayloadTooLargeError
+from .errors import ConnectorRequestError, PayloadTooLargeError
 from .openapi import current_openapi
 from .permissions import (
     BASE_TOOL_POLICY_DEFAULTS,
@@ -52,13 +54,22 @@ from .utils import json_dumps, json_loads, new_id, now_iso, parse_iso, token_ref
 
 
 class Store:
-    def __init__(self, path: str, max_content_bytes: int = DEFAULT_MAX_STORED_CONTENT_BYTES) -> None:
+    def __init__(
+        self,
+        path: str,
+        max_content_bytes: int = DEFAULT_MAX_STORED_CONTENT_BYTES,
+        *,
+        allow_unsafe_connector_urls_for_tests: bool = False,
+    ) -> None:
         self.path = path
         self.max_content_bytes = max_content_bytes
         self.adapter: RuntimeAdapter = LocalPrototypeAdapter()
         self.probe_adapter = CodexCliProbeAdapter()
         self._lock = threading.RLock()
         self._legacy_integration_secret_scrubbed = False
+        # This test seam is deliberately constructor-only: production callers
+        # cannot opt into unsafe connector targets through integration payloads.
+        self._allow_unsafe_connector_urls_for_tests = allow_unsafe_connector_urls_for_tests
         # Connector credentials are process-local. SQLite keeps only an opaque
         # digest reference so a persisted control-plane database cannot recover
         # outbound tokens after a restart.
@@ -431,7 +442,8 @@ class Store:
             self._legacy_integration_secret_scrubbed = True
         self.conn.execute(
             "UPDATE integrations SET credential_status = 'registration_required', "
-            "status = CASE WHEN base_url IS NULL OR base_url = '' THEN 'metadata_only' "
+            "status = CASE WHEN provider = 'webhook' THEN 'credential_required' "
+            "WHEN base_url IS NULL OR base_url = '' THEN 'metadata_only' "
             "ELSE 'credential_required' END"
         )
         pending_action_columns = {
@@ -1650,41 +1662,68 @@ class Store:
         return self.get_pending_action(action_id)
 
     def queue_tool_action(self, action: dict[str, Any], request_id: str, source: str) -> dict[str, Any]:
-        action = self.get_pending_action(action["id"])
-        if action["status"] != "approved":
-            raise ValueError("tool action must be approved before it can be queued")
-        run_id = action.get("execution_run_id")
-        if not run_id:
-            proposed_run_id = new_id("run")
-            with self._lock:
-                bound = self.conn.execute(
-                    """
-                    UPDATE pending_actions
-                    SET execution_run_id = ?, updated_at = ?
-                    WHERE id = ? AND status = 'approved' AND execution_run_id IS NULL
-                    """,
-                    (proposed_run_id, now_iso(), action["id"]),
-                ).rowcount
-                self.conn.commit()
-            action = self.get_pending_action(action["id"])
-            run_id = action.get("execution_run_id")
-            if not run_id:
-                raise ValueError("tool action is no longer queueable")
-
+        action_id = action["id"]
         created_run = False
+        recovered_orphan_binding = False
+        run_id: str | None = None
         with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
             try:
-                run = self.get_run(run_id)
-            except KeyError:
-                run = self.create_run(
-                    action["session_id"],
-                    request_id,
-                    trigger_source=f"tool:{action['tool']}",
-                    job_id=None,
-                    assign_worker=False,
-                    run_id=run_id,
+                row = self.conn.execute(
+                    "SELECT * FROM pending_actions WHERE id = ?", (action_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(action_id)
+                action = self.pending_action_from_row(row)
+                if action["status"] != "approved":
+                    raise ValueError("tool action must be approved before it can be queued")
+                run_id = action.get("execution_run_id")
+                run_exists = bool(
+                    run_id
+                    and self.conn.execute("SELECT 1 FROM job_runs WHERE id = ?", (run_id,)).fetchone()
                 )
-                created_run = True
+                if not run_exists:
+                    timestamp = now_iso()
+                    recovered_orphan_binding = bool(run_id)
+                    if not run_id:
+                        run_id = new_id("run")
+                        bound = self.conn.execute(
+                            """
+                            UPDATE pending_actions
+                            SET execution_run_id = ?, updated_at = ?
+                            WHERE id = ? AND status = 'approved' AND execution_run_id IS NULL
+                            """,
+                            (run_id, timestamp, action_id),
+                        ).rowcount
+                        if bound != 1:
+                            raise ValueError("tool action is no longer queueable")
+                    self.conn.execute(
+                        """
+                        INSERT INTO job_runs
+                        (id, tenant_id, project_id, job_id, session_id, worker_id, trigger_source,
+                         status, lease_expires_at, lease_token, lease_generation, result, created_at, updated_at, started_at)
+                        VALUES (?, ?, ?, NULL, ?, NULL, ?, 'queued', NULL, NULL, 0, ?, ?, ?, NULL)
+                        """,
+                        (
+                            run_id,
+                            DEFAULT_TENANT_ID,
+                            DEFAULT_PROJECT_ID,
+                            action["session_id"],
+                            f"tool:{action['tool']}",
+                            json_dumps({}),
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                    self.refresh_session_run_state_locked(action["session_id"], timestamp)
+                    created_run = True
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+        if not run_id:
+            raise ValueError("tool action is no longer queueable")
+        run = self.get_run(run_id)
         if created_run:
             self.append_event(
                 action["session_id"],
@@ -1694,11 +1733,24 @@ class Store:
                     "tool": action["tool"],
                     "run_id": run["id"],
                     "source": source,
+                    "recovered_orphan_binding": recovered_orphan_binding,
                 },
                 request_id,
                 turn_id=action["turn_id"],
             )
             self.audit("tool.execution_enqueue", "pending_action", action["id"], request_id)
+        else:
+            # A retry after a crash between the transaction commit and event/audit
+            # emission leaves durable reconciliation evidence instead of silently
+            # treating the already-bound run as complete.
+            self.append_event(
+                action["session_id"],
+                "tool.execution_queue_reconciled",
+                {"action_id": action["id"], "tool": action["tool"], "run_id": run["id"], "source": source},
+                request_id,
+                turn_id=action["turn_id"],
+            )
+            self.audit("tool.execution_reconcile", "pending_action", action["id"], request_id)
         return {
             "type": "tool_execution_queued",
             "action": self.get_pending_action(action["id"]),
@@ -1738,8 +1790,7 @@ class Store:
             raise ValueError("decision must be approve or reject")
         if action["status"] != "pending":
             if decision == "approve" and action["status"] == "approved":
-                if not action.get("execution_run_id"):
-                    self.queue_tool_action(action, request_id, source="approval_recovery")
+                self.queue_tool_action(action, request_id, source="approval_recovery")
                 return self.get_pending_action(action_id)
             raise ValueError("pending action is already resolved")
         status = "approved" if decision == "approve" else "rejected"
@@ -2382,6 +2433,8 @@ class Store:
         request_id: str,
     ) -> dict[str, Any]:
         run = self.validate_worker_run(worker_id, run_id, lease_token)
+        if run["trigger_source"].startswith("tool:"):
+            raise ValueError("tool runs must use the worker-scoped tools/execute endpoint")
         adapter_result = self.run_adapter_turn(
             run["session_id"],
             source=run["trigger_source"],
@@ -2436,6 +2489,8 @@ class Store:
         request_id: str,
     ) -> dict[str, Any]:
         run = self.validate_worker_run(worker_id, run_id, lease_token)
+        if run["trigger_source"].startswith("tool:"):
+            raise ValueError("tool runs must use the worker-scoped tools/execute endpoint")
         session = self.get_session(run["session_id"])
         if session.get("active_turn_id"):
             raise ValueError("session already has an active turn")
@@ -2655,15 +2710,48 @@ class Store:
         except Exception:
             failed_at = now_iso()
             with self._lock:
-                self.conn.execute(
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    action_failed = self.conn.execute(
                     """
                     UPDATE pending_actions
                     SET status = 'failed', execution_lease_generation = NULL, updated_at = ?
                     WHERE id = ? AND status = 'executing' AND execution_run_id = ?
+                      AND execution_lease_generation = ?
                     """,
-                    (failed_at, action_id, run_id),
-                )
-                self.conn.commit()
+                    (failed_at, action_id, run_id, run["lease_generation"]),
+                    ).rowcount
+                    if action_failed == 1:
+                        self.conn.execute(
+                            """
+                            UPDATE job_runs
+                            SET status = 'failed', result = ?, finished_at = ?, lease_expires_at = NULL,
+                                lease_token = NULL, updated_at = ?
+                            WHERE id = ? AND status = 'running' AND worker_id = ? AND lease_token = ?
+                              AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                            """,
+                            (
+                                json_dumps({"tool_action_id": action_id, "error": "tool execution failed"}),
+                                failed_at,
+                                failed_at,
+                                run_id,
+                                worker_id,
+                                payload.get("lease_token"),
+                                failed_at,
+                            ),
+                        )
+                        self.conn.execute(
+                            """
+                            UPDATE workers SET active_run_id = NULL, updated_at = ?
+                            WHERE id = ? AND active_run_id = ?
+                            """,
+                            (failed_at, worker_id, run_id),
+                        )
+                        self.refresh_session_run_state_locked(run["session_id"], failed_at, terminal_status="failed")
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
             self.audit("worker.tool_execute_failed", "pending_action", action_id, request_id)
             self.append_event(
                 run["session_id"],
@@ -2785,46 +2873,103 @@ class Store:
         )
         requeued = 0
         for row in rows:
+            recovery_action = "requeued"
+            final_status = "queued"
             with self._lock:
-                updated = self.conn.execute(
-                    """
-                    UPDATE job_runs
-                    SET status = 'queued',
-                        worker_id = NULL,
-                        lease_expires_at = NULL,
-                        lease_token = NULL,
-                        updated_at = ?
-                    WHERE id = ?
-                      AND status = 'running'
-                      AND lease_expires_at IS NOT NULL
-                      AND lease_expires_at <= ?
-                    """,
-                    (timestamp, row["id"], timestamp),
-                ).rowcount
-                if updated != 1:
-                    self.conn.commit()
-                    continue
-                requeued += 1
-                if row["worker_id"]:
-                    self.conn.execute(
-                        "UPDATE workers SET active_run_id = NULL, updated_at = ? WHERE id = ? AND active_run_id = ?",
-                        (timestamp, row["worker_id"], row["id"]),
+                self.conn.execute("BEGIN IMMEDIATE")
+                try:
+                    current = self.conn.execute(
+                        """
+                        SELECT * FROM job_runs WHERE id = ? AND status = 'running'
+                          AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                        """,
+                        (row["id"], timestamp),
+                    ).fetchone()
+                    if current is None:
+                        self.conn.commit()
+                        continue
+                    action = self.conn.execute(
+                        "SELECT * FROM pending_actions WHERE execution_run_id = ?", (row["id"],)
+                    ).fetchone()
+                    terminal_status: str | None = None
+                    result: dict[str, Any] | None = None
+                    if action is not None and action["status"] == "executing":
+                        terminal_status = "failed"
+                        recovery_action = "ambiguous_failed"
+                        result = {
+                            "tool_action_id": action["id"],
+                            "error": "tool execution lease expired; external side effect outcome is ambiguous",
+                        }
+                        self.conn.execute(
+                            """
+                            UPDATE pending_actions
+                            SET status = 'failed', execution_lease_generation = NULL, updated_at = ?
+                            WHERE id = ? AND status = 'executing'
+                            """,
+                            (timestamp, action["id"]),
+                        )
+                    elif action is not None and action["status"] == "executed":
+                        terminal_status = "succeeded"
+                        recovery_action = "terminal_converged"
+                        result = {"tool_action_id": action["id"], "recovered": "action_executed_before_run_completion"}
+                    elif action is not None and action["status"] == "failed":
+                        terminal_status = "failed"
+                        recovery_action = "terminal_converged"
+                        result = {"tool_action_id": action["id"], "recovered": "action_failed_before_run_completion"}
+                    elif current["trigger_source"].startswith("tool:") and (
+                        action is None or action["status"] != "approved"
+                    ):
+                        terminal_status = "failed"
+                        recovery_action = "invalid_tool_run_failed"
+                        result = {
+                            "tool_action_id": action["id"] if action is not None else None,
+                            "error": "expired tool run has no queueable action state",
+                        }
+
+                    if terminal_status:
+                        final_status = terminal_status
+                        self.conn.execute(
+                            """
+                            UPDATE job_runs
+                            SET status = ?, result = ?, finished_at = ?, lease_expires_at = NULL,
+                                lease_token = NULL, updated_at = ?
+                            WHERE id = ? AND status = 'running'
+                            """,
+                            (terminal_status, json_dumps(result), timestamp, timestamp, row["id"]),
+                        )
+                    else:
+                        self.conn.execute(
+                            """
+                            UPDATE job_runs
+                            SET status = 'queued', worker_id = NULL, lease_expires_at = NULL,
+                                lease_token = NULL, updated_at = ?
+                            WHERE id = ? AND status = 'running'
+                            """,
+                            (timestamp, row["id"]),
+                        )
+                    if row["worker_id"]:
+                        self.conn.execute(
+                            "UPDATE workers SET active_run_id = NULL, updated_at = ? WHERE id = ? AND active_run_id = ?",
+                            (timestamp, row["worker_id"], row["id"]),
+                        )
+                    self.refresh_session_run_state_locked(
+                        row["session_id"], timestamp, terminal_status="failed" if terminal_status == "failed" else "idle"
                     )
-                self.conn.execute(
-                    """
-                    UPDATE pending_actions
-                    SET status = 'approved', execution_lease_generation = NULL, updated_at = ?
-                    WHERE execution_run_id = ? AND status = 'executing'
-                    """,
-                    (timestamp, row["id"]),
-                )
-                self.refresh_session_run_state_locked(row["session_id"], timestamp)
-                self.conn.commit()
+                    self.conn.commit()
+                    requeued += 1
+                except Exception:
+                    self.conn.rollback()
+                    raise
             self.audit("run.lease_expired", "run", row["id"], request_id)
             self.append_event(
                 row["session_id"],
                 "worker.lease_expired",
-                {"run_id": row["id"], "worker_id": row["worker_id"]},
+                {
+                    "run_id": row["id"],
+                    "worker_id": row["worker_id"],
+                    "recovery_action": recovery_action,
+                    "final_status": final_status,
+                },
                 request_id,
                 severity="warning",
             )
@@ -2842,6 +2987,20 @@ class Store:
         timestamp = now_iso()
         run = self.get_run(run_id)
         with self._lock:
+            if run["trigger_source"].startswith("tool:"):
+                action = self.conn.execute(
+                    "SELECT status, tool FROM pending_actions WHERE execution_run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                expected_action_status = "executed" if status == "succeeded" else "failed"
+                if (
+                    action is None
+                    or run["trigger_source"] != f"tool:{action['tool']}"
+                    or action["status"] != expected_action_status
+                ):
+                    raise ValueError(
+                        "tool run cannot be completed before its bound action reaches the matching terminal state"
+                    )
             if worker_id is not None or lease_token is not None:
                 if not worker_id or not lease_token:
                     raise PermissionError("worker_id and lease_token are required")
@@ -3103,8 +3262,8 @@ class Store:
             raise ValueError("integration secret must be a string")
         has_secret = bool(secret_material)
         has_base_url = bool(payload.get("base_url"))
-        status = "configured" if has_base_url and has_secret else (
-            "credential_required" if has_base_url else "metadata_only"
+        status = "configured" if has_secret and (has_base_url or provider == "webhook") else (
+            "credential_required" if has_base_url or provider == "webhook" else "metadata_only"
         )
         credential_status = "registered" if has_secret else "registration_required"
         with self._lock:
@@ -3149,6 +3308,32 @@ class Store:
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("integration base_url must not include userinfo")
 
+    def resolve_connector_target(self, url: str) -> tuple[Any, tuple[str, ...]]:
+        """Resolve once, reject unsafe answers, and return addresses to pin for connection."""
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            raise ValueError("connector target must include a host")
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            addresses = tuple(
+                sorted(
+                    {
+                        str(ipaddress.ip_address(info[4][0]))
+                        for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                    }
+                )
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("connector target host could not be resolved") from exc
+        if not addresses:
+            raise ValueError("connector target host could not be resolved")
+        if not self._allow_unsafe_connector_urls_for_tests and any(
+            not ipaddress.ip_address(address).is_global for address in addresses
+        ):
+            raise ValueError("connector target resolves to a restricted network address")
+        return parsed, addresses
+
     def register_integration_credential(
         self,
         integration_id: str,
@@ -3159,7 +3344,7 @@ class Store:
         if not isinstance(secret, str) or not secret:
             raise ValueError("secret is required")
         integration = self.get_integration(integration_id)
-        if not integration.get("base_url"):
+        if integration["provider"] != "webhook" and not integration.get("base_url"):
             raise ValueError("integration base_url is required before registering a credential")
         timestamp = now_iso()
         with self._lock:
@@ -3204,8 +3389,8 @@ class Store:
             "name": row["name"],
             "base_url": row["base_url"],
             "secret_ref": row["secret_ref"],
-            "status": "configured" if has_base_url and credential_registered else (
-                "credential_required" if has_base_url else "metadata_only"
+            "status": "configured" if credential_registered and (has_base_url or row["provider"] == "webhook") else (
+                "credential_required" if has_base_url or row["provider"] == "webhook" else "metadata_only"
             ),
             "credential_status": "registered" if credential_registered else "registration_required",
             "capabilities": json_loads(row["capabilities"], {}),
@@ -3282,24 +3467,47 @@ class Store:
         url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
         if query:
             url = f"{url}?{urlencode(query)}"
+        parsed_url, resolved_addresses = self.resolve_connector_target(url)
         raw_body = json_dumps(body).encode("utf-8")
-        request = Request(
-            url,
-            data=raw_body,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "cloudagent-platform-connector/0.1",
-            },
-        )
-        try:
-            with urlopen(request, timeout=30) as response:
+        request_headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "cloudagent-platform-connector/0.1",
+            "Host": parsed_url.netloc,
+        }
+        request_path = parsed_url.path or "/"
+        if parsed_url.query:
+            request_path = f"{request_path}?{parsed_url.query}"
+        port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+        status_code: int | None = None
+        response_body = ""
+        last_transport_error: BaseException | None = None
+        for resolved_address in resolved_addresses:
+            if parsed_url.scheme == "https":
+                connection: http.client.HTTPConnection = _PinnedHTTPSConnection(
+                    parsed_url.hostname, port, resolved_address, timeout=30
+                )
+            else:
+                connection = _PinnedHTTPConnection(parsed_url.hostname, port, resolved_address, timeout=30)
+            try:
+                connection.request("POST", request_path, body=raw_body, headers=request_headers)
+                response = connection.getresponse()
+                response_bytes = response.read(self.max_content_bytes + 1)
                 status_code = response.status
-                response_body = response.read().decode("utf-8", errors="replace")
-        except HTTPError as exc:
-            status_code = exc.code
-            response_body = exc.read().decode("utf-8", errors="replace")
+                if len(response_bytes) > self.max_content_bytes:
+                    raise ConnectorRequestError(status_code, "response body exceeds maximum size")
+                response_body = response_bytes.decode("utf-8", errors="replace")
+                break
+            except ConnectorRequestError:
+                raise
+            except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+                last_transport_error = exc
+            finally:
+                connection.close()
+        if status_code is None:
+            raise ConnectorRequestError(None) from last_transport_error
+        if not 200 <= status_code < 300:
+            raise ConnectorRequestError(status_code, redact_connector_response(response_body, token))
         try:
             parsed_body: Any = json.loads(response_body) if response_body else None
         except json.JSONDecodeError:
@@ -3307,7 +3515,7 @@ class Store:
         return {
             "provider": integration["provider"],
             "integration_id": integration["id"],
-            "ok": 200 <= status_code < 400,
+            "ok": True,
             "request": {
                 "method": "POST",
                 "url": url,
@@ -3333,6 +3541,33 @@ def parse_csv_set(value: str | None) -> set[str]:
     if not value:
         return set()
     return {item.strip() for item in value.split(",") if item.strip()}
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Connect to a checked address while preserving the original Host header."""
+
+    def __init__(self, host: str, port: int, resolved_address: str, timeout: float) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._resolved_address = resolved_address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._resolved_address, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS variant that pins TCP to a checked address but validates the hostname."""
+
+    def __init__(self, host: str, port: int, resolved_address: str, timeout: float) -> None:
+        super().__init__(host, port, timeout=timeout)
+        self._resolved_address = resolved_address
+
+    def connect(self) -> None:
+        raw_socket = socket.create_connection((self._resolved_address, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+
+
+def redact_connector_response(response_body: str, token: str) -> str:
+    return response_body.replace(token, "<redacted>")[:1024]
 
 
 def is_loopback_host(host: str) -> bool:
