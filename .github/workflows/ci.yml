@@ -30,7 +30,7 @@ jobs:
       - name: Compile Python sources
         run: python -m py_compile src/cloudagent_platform/*.py tests/*.py
 
-      - name: Run unit and integration tests
+      - name: Run unit, integration, OpenAPI, and release contract tests
         env:
           PYTHONPATH: src
           PYTHONWARNINGS: error::ResourceWarning
@@ -66,7 +66,7 @@ jobs:
 
       - name: Validate HFS wrapper export
         run: |
-          bash -n cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/start.sh cloud/hfs/smoke_mounted_runtime.sh
+          bash -n cloud/hfs/build_runtime_snapshot.sh cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/start.sh cloud/hfs/smoke_mounted_runtime.sh
           bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space
 
       - name: Smoke-test mounted HFS runtime

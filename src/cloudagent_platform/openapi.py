@@ -1,6 +1,87 @@
 from __future__ import annotations
 
+import re
+
 from . import __version__
+
+
+_HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
+_PATH_PARAMETER = re.compile(r"\{([^}]+)\}")
+
+
+def _operation_id(method: str, path: str) -> str:
+    """Return a stable, unique operation id derived from the implemented route."""
+    parts = [part.strip("{}") for part in path.split("/") if part]
+    return "_".join([method.lower(), *parts]).replace("-", "_")
+
+
+def _success_statuses(method: str, path: str) -> tuple[str, ...]:
+    if method != "post":
+        return ("200",)
+    if path == "/api/v1/sessions/{session_id}/events":
+        # A normal event is persisted immediately, while user.message is
+        # accepted after it has queued worker execution.
+        return ("201", "202")
+    if path in {
+        "/api/v1/agents",
+        "/api/v1/environments",
+        "/api/v1/sessions",
+        "/api/v1/jobs",
+        "/api/v1/workers",
+        "/api/v1/integrations",
+        "/api/v1/vaults",
+        "/api/v1/files",
+        "/api/v1/tool-policies",
+    } or path.endswith("/credentials") or path.endswith("/events") or path.endswith("/artifacts") or path.endswith("/usage"):
+        return ("201",)
+    if path.endswith("/trigger") or path.endswith("/enqueue") or "/webhooks/" in path:
+        return ("202",)
+    return ("200",)
+
+
+def _complete_contract(paths: dict[str, dict[str, object]]) -> None:
+    """Apply route-level contract invariants to the generated implementation map.
+
+    Keeping this normalization beside the route inventory makes a newly added
+    handler fail closed in the contract test instead of silently shipping an
+    undocumented path parameter, response, or operation id.
+    """
+    for path, path_item in paths.items():
+        parameter_names = _PATH_PARAMETER.findall(path)
+        if parameter_names:
+            path_item["parameters"] = [
+                {
+                    "name": name,
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"},
+                }
+                for name in parameter_names
+            ]
+        for method, value in path_item.items():
+            if method not in _HTTP_METHODS or not isinstance(value, dict):
+                continue
+            value.setdefault("operationId", _operation_id(method, path))
+            responses = value.setdefault("responses", {})
+            if not isinstance(responses, dict):
+                raise ValueError(f"OpenAPI responses must be an object for {method.upper()} {path}")
+            for status in _success_statuses(method, path):
+                responses.setdefault(
+                    status,
+                    {
+                        "description": "Successful response",
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    },
+                )
+            if path.endswith("/events/stream"):
+                responses["200"] = {
+                    "description": "Server-sent session event stream",
+                    "content": {"text/event-stream": {"schema": {"type": "string"}}},
+                }
+            responses.setdefault("400", {"$ref": "#/components/responses/InvalidRequest"})
+            if value.get("security", [{"BearerAuth": []}]):
+                responses.setdefault("401", {"$ref": "#/components/responses/AuthenticationError"})
+            responses.setdefault("404", {"$ref": "#/components/responses/NotFound"})
 
 
 def current_openapi() -> dict[str, object]:
@@ -149,7 +230,22 @@ def current_openapi() -> dict[str, object]:
         },
         "/api/v1/files": {"get": {"summary": "List files"}, "post": {"summary": "Create JSON-backed file"}},
         "/api/v1/files/{file_id}": {"get": {"summary": "Get file metadata"}},
-        "/api/v1/files/{file_id}/content": {"get": {"summary": "Download file content"}},
+        "/api/v1/files/{file_id}/content": {
+            "get": {
+                "summary": "Download file content",
+                "responses": {
+                    "200": {
+                        "description": "Raw file bytes",
+                        "content": {
+                            "application/octet-stream": {
+                                "schema": {"type": "string", "format": "binary"}
+                            }
+                        },
+                    },
+                    "404": {"$ref": "#/components/responses/NotFound"},
+                },
+            }
+        },
         "/api/v1/artifacts": {
             "get": {
                 "summary": "List artifacts across sessions",
@@ -218,6 +314,7 @@ def current_openapi() -> dict[str, object]:
             }
         },
     }
+    _complete_contract(paths)
     return {
         "openapi": "3.1.0",
         "info": {

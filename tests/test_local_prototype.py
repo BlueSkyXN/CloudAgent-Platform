@@ -22,7 +22,7 @@ class LocalPrototypeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         db_path = str(Path(self.tmp.name) / "test.sqlite3")
-        self.runtime = Runtime(Store(db_path), "test-token")
+        self.runtime = Runtime(Store(db_path, allow_unsafe_connector_urls_for_tests=True), "test-token")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.runtime))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

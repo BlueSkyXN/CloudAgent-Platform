@@ -20,6 +20,16 @@ out_dir="$(canonical_path "${requested_out_dir}")"
 repo_root="$(canonical_path "${repo_root}")"
 hfs_dir="$(canonical_path "${hfs_dir}")"
 
+git_dirty=false
+if [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
+  git_dirty=true
+  if [[ "${CLOUDAGENT_ALLOW_DIRTY_EXPORT:-false}" != "true" ]]; then
+    printf 'refusing Space export from dirty working tree; commit or stash changes first\n' >&2
+    exit 65
+  fi
+  printf 'warning: exporting a dirty non-release wrapper bundle; do not publish it as a release\n' >&2
+fi
+
 python3 - "${out_dir}" "${repo_root}" "${hfs_dir}" <<'PY'
 from pathlib import Path
 import sys
@@ -67,10 +77,11 @@ source_path=cloud/hfs
 bundle_generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 mode=bucket-mounted-runtime
 runtime_bucket=BlueSkyXN/cloudagent-platform-hfs-runtime
-runtime_mount=/mnt/cloudagent-runtime
+runtime_mount=/mnt/cloudagent-runtime/releases/<release-id>
+runtime_pin_required=true
 EOT
 
-python3 - "${out_dir}" "${repo_root}" <<'PY'
+python3 - "${out_dir}" "${repo_root}" "${git_dirty}" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -82,6 +93,7 @@ from pathlib import Path
 
 out_dir = Path(sys.argv[1])
 repo_root = Path(sys.argv[2])
+git_dirty = sys.argv[3] == "true"
 
 
 def git_value(*args: str) -> str | None:
@@ -108,17 +120,17 @@ for path in sorted(out_dir.rglob("*")):
         }
     )
 
-status = git_value("status", "--short")
 manifest = {
     "schema_version": 1,
     "mode": "bucket-mounted-runtime",
     "source_repo": "https://github.com/BlueSkyXN/CloudAgent-Platform.git",
     "source_path": "cloud/hfs",
     "runtime_bucket": "BlueSkyXN/cloudagent-platform-hfs-runtime",
-    "runtime_mount": "/mnt/cloudagent-runtime",
+    "runtime_mount": "/mnt/cloudagent-runtime/releases/<release-id>",
+    "runtime_pin_required": True,
     "generated_at": datetime.now(timezone.utc).isoformat(),
     "git_sha": git_value("rev-parse", "--verify", "HEAD"),
-    "git_dirty": bool(status),
+    "git_dirty": git_dirty,
     "files": files,
     "forbidden_paths": [".git", ".env", ".env.local", "local", "data", "logs"],
 }

@@ -5,10 +5,11 @@ It combines scheduling, session/event handling, worker leases, runtime policy,
 tool approvals, artifacts, usage evidence, Vault references, and a responsive
 operator console in one dependency-free Python service.
 
-The current release line is a **company-showcase candidate for the local
-runtime**. It is designed to demonstrate a complete, honest execution loop; it
-does not claim production multi-tenant isolation, a hardened remote worker
-fleet, or runtime secret injection.
+`v0.2.0` is a published **company-showcase release** for the local runtime. It
+demonstrates a complete, honest execution loop; it does not claim production
+multi-tenant isolation, a hardened remote worker fleet, or runtime secret
+injection. Current hardening work is tracked as **Unreleased** until it passes
+the same immutable release gate and is published under a new version.
 
 ## What the Showcase Proves
 
@@ -122,6 +123,10 @@ Important boundaries:
 - Dify/Feishu calls are approval- and lease-gated control-plane connectors.
   Provider-specific idempotency is not implemented: an ambiguous remote
   failure is recorded as `failed` and is never replayed automatically.
+- Connector targets are resolved once per request, every resolved address must
+  be public, and the HTTP/TLS connection is pinned to a validated address.
+  Redirects are not followed, upstream errors are redacted, and response bodies
+  are capped at 1 MiB.
 
 ## Implemented Surfaces
 
@@ -198,14 +203,14 @@ control-plane/execution-plane boundary.
 
 ## Validation
 
-Run the release-candidate gate:
+Run the release hardening gate:
 
 ```bash
 python3 -m py_compile src/cloudagent_platform/*.py tests/*.py
 PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests
 node --check src/cloudagent_platform/web/console.js
 python3 -m pip wheel . --no-deps --wheel-dir /tmp/cloudagent-wheel
-bash -n cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/start.sh cloud/hfs/smoke_mounted_runtime.sh
+bash -n cloud/hfs/build_runtime_snapshot.sh cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/start.sh cloud/hfs/smoke_mounted_runtime.sh
 bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space
 bash cloud/hfs/smoke_mounted_runtime.sh
 git diff --check
@@ -218,9 +223,12 @@ mounted-runtime startup smoke checks on pushes to `main` and pull requests.
 
 `cloud/hfs/` is the Hugging Face Docker Space wrapper. It is deployment
 packaging rather than product source, exports a flat safe Space root, and starts
-the runtime from the mounted runtime bucket. Publishing a new showcase build
-still requires an explicit runtime-bucket sync and live Space readback; local
-completion alone is not deployment proof.
+only an immutable, manifest-verified runtime release from the mounted runtime
+bucket. Build a release snapshot from a clean commit with
+`bash cloud/hfs/build_runtime_snapshot.sh /tmp/cloudagent-runtime`, sync its
+`releases/v<version>-<git-sha>/` directory, then configure the Space with the
+matching `CLOUDAGENT_RUNTIME_RELEASE`, `CLOUDAGENT_RUNTIME_VERSION`, and
+`CLOUDAGENT_RUNTIME_GIT_SHA`. Local completion alone is not deployment proof.
 
 `local/20260616/` contains the SDLC, threat model, data model, validation plan,
 roadmap, and deployment records. The implemented API contract is always the

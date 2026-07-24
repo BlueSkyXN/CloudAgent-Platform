@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .console import get_console_asset
-from .errors import PayloadTooLargeError
+from .errors import ConnectorRequestError, PayloadTooLargeError
 from .openapi import current_openapi
 from .scheduler import Runtime
 from .utils import json_dumps, new_id
@@ -545,6 +545,8 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                 self.respond_error(HTTPStatus.UNAUTHORIZED, "authentication_error", str(exc), request_id)
             except PayloadTooLargeError as exc:
                 self.respond_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "payload_too_large_error", str(exc), request_id)
+            except ConnectorRequestError as exc:
+                self.respond_error(HTTPStatus.BAD_GATEWAY, "connector_request_error", str(exc), request_id)
             except KeyError as exc:
                 self.respond_error(HTTPStatus.NOT_FOUND, "not_found_error", str(exc), request_id)
             except ValueError as exc:
