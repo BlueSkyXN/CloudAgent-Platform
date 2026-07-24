@@ -117,6 +117,37 @@ class ShowcaseService:
             },
         }
 
+    def session_workspace(self, session_id: str) -> dict[str, Any]:
+        """Return the complete read model used by the Console session workspace."""
+        # The Store lock is re-entrant, so all component reads describe one
+        # coherent local control-plane snapshot without weakening their APIs.
+        with self.store._lock:
+            session = self.store.get_session(session_id)
+            events = self.store.list_events(session_id)
+            artifacts = self.store.list_artifacts(session_id)
+            usage = self.store.list_usage(session_id)
+            pending_actions = self.store.list_pending_actions(session_id)
+            audit = self.store.list_session_audit(session_id)
+            tools = self.store.list_tools()
+        return {
+            "type": "cloudagent.admin.session_workspace",
+            "session": session,
+            "events": events,
+            "artifacts": artifacts,
+            "usage": usage,
+            "pending_actions": pending_actions,
+            "audit": audit,
+            "tools": tools,
+            "counts": {
+                "events": len(events),
+                "artifacts": len(artifacts),
+                "usage_records": len(usage),
+                "pending_actions": len(pending_actions),
+                "audit_records": len(audit),
+            },
+            "last_event_id": events[-1]["id"] if events else None,
+        }
+
     def bootstrap(self, request_id: str) -> dict[str, Any]:
         # Store operations use the same re-entrant lock, so this covers every
         # list/create decision as one local-process idempotency boundary.

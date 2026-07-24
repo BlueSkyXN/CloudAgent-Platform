@@ -164,6 +164,16 @@ Important boundaries:
 - Runtime, Sessions, Governance, and Resources workspaces with functional
   create, queue, claim/execute, tool request/approval, file and artifact
   download, and evidence inspection flows.
+- URL-addressable workspace and Session selection with browser Back/Forward
+  restoration; bearer credentials remain in `sessionStorage` and never enter
+  URLs. Session message drafts are scoped to the selected Session and survive
+  recoverable navigation within the browser session.
+- Calm Precision semantic tokens, near-black primary actions, restrained green
+  selection emphasis, flat data hierarchy, visible high-contrast keyboard
+  focus, 44px phone targets, and 16px phone form controls.
+- `GET /api/v1/admin/sessions/{session_id}/workspace` aggregates the protected
+  Session trace, approvals, evidence, usage, audit, and tools for the Console
+  without weakening any worker, lease, policy, or credential boundary.
 - Loading, empty, disabled, success, and persistent form-error states;
   responsive layout; modal focus trapping and restoration; reduced-motion
   support; strict static-asset CSP.

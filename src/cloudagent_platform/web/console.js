@@ -3,6 +3,7 @@
   "use strict";
   const TOKEN_KEY = "cloudagent.console.token";
   const VIEW_KEY = "cloudagent.console.view";
+  const DRAFT_KEY_PREFIX = "cloudagent.console.draft.";
   const views = ["overview", "runtime", "sessions", "governance", "resources"];
   const labels = {
     overview: "Overview",
@@ -11,9 +12,11 @@
     governance: "Governance",
     resources: "Resources",
   };
+  const initialRoute = readRoute();
   const state = {
     token: sessionStorage.getItem(TOKEN_KEY) || "",
-    view: sessionStorage.getItem(VIEW_KEY) || "overview",
+    view: initialRoute.view || sessionStorage.getItem(VIEW_KEY) || "overview",
+    sessionId: initialRoute.sessionId,
     overview: null,
     data: {},
     busy: new Set(),
@@ -79,6 +82,40 @@
     `<span class="badge ${escapeHtml(String(value || "unknown").replaceAll(" ", "_"))}">${escapeHtml(value || "unknown")}</span>`;
   const setBusy = (key, busy) =>
     busy ? state.busy.add(key) : state.busy.delete(key);
+  function readRoute() {
+    const params = new URLSearchParams(window.location.search);
+    const requestedView = params.get("view");
+    const sessionId = params.get("session") || null;
+    return {
+      view: sessionId
+        ? "sessions"
+        : views.includes(requestedView)
+          ? requestedView
+          : null,
+      sessionId,
+    };
+  }
+  function routeUrl(view, sessionId = null) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", view);
+    if (view === "sessions" && sessionId)
+      url.searchParams.set("session", sessionId);
+    else url.searchParams.delete("session");
+    return `${url.pathname}${url.search}${url.hash}`;
+  }
+  function writeRoute(view, sessionId = null, { replace = false } = {}) {
+    const next = routeUrl(view, sessionId);
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (next !== current)
+      window.history[replace ? "replaceState" : "pushState"](
+        { view, sessionId },
+        "",
+        next,
+      );
+    state.view = view;
+    state.sessionId = view === "sessions" ? sessionId : null;
+    sessionStorage.setItem(VIEW_KEY, view);
+  }
   const focusableSelector =
     'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
   function toast(message, level = "ok") {
@@ -133,7 +170,7 @@
     state.overview = null;
     state.data = {};
     sessionStorage.removeItem(TOKEN_KEY);
-    closeDialog({ restoreFocus: false });
+    closeDialog({ restoreFocus: false, syncRoute: false });
     render();
     toast(message, "warn");
   }
@@ -144,7 +181,7 @@
     const nav = views
       .map(
         (v, i) =>
-          `<button type="button" data-view="${v}" ${state.view === v ? 'aria-current="page"' : ""}><span class="nav-index">0${i + 1}</span>${labels[v]}</button>`,
+          `<a href="${routeUrl(v)}" data-view="${v}" ${state.view === v ? 'aria-current="page"' : ""}><span class="nav-index">0${i + 1}</span>${labels[v]}</a>`,
       )
       .join("");
     return `<div class="topbar"><div class="brand"><span class="brand-mark">CA</span><span>CloudAgent<small>CONTROL CONSOLE</small></span></div><button id="mobile-nav" class="btn secondary small" type="button" aria-controls="side-nav" aria-expanded="false">Menu</button></div><div class="shell"><aside class="sidebar" id="side-nav"><div class="brand"><span class="brand-mark">CA</span><span>CloudAgent<small>CONTROL CONSOLE</small></span></div><nav class="nav" aria-label="Workspace">${nav}</nav><div class="sidebar-footer"><span class="micro">Bearer session active</span><button class="btn secondary small" data-action="disconnect" type="button">Disconnect</button></div></aside><main id="main" class="workspace">${content}</main></div>`;
@@ -344,7 +381,7 @@
     if (!d)
       return `<div class="view">${heading("COLLABORATION / 03", "Sessions", "Turns, approvals and evidence in one trace.")}${loading()}</div>`;
     const rows = d.sessions || [];
-    return `<div class="view" data-testid="sessions-view">${heading("COLLABORATION / 03", "Sessions", "A session binds an agent, environment and optional Vault references.", `<button class="btn secondary" data-action="refresh" type="button">Refresh</button><button class="btn" data-modal="session" type="button" ${!d.agents.length || !d.environments.length ? "disabled" : ""}>Create session</button>`)}${!d.agents.length || !d.environments.length ? `<p class="secret-note">Create at least one agent and environment in Runtime before opening a session.</p>` : ""}${panel("Session register", rows.length ? `<div class="table-wrap"><table class="data-table" aria-label="Session register"><thead><tr><th scope="col">Session</th><th scope="col">Agent / environment</th><th scope="col">Turn</th><th scope="col">Last activity</th><th scope="col">Actions</th></tr></thead><tbody>${rows.map((s) => `<tr><td>${id(s.id)}</td><td class="mono">${escapeHtml(s.agent_snapshot?.id || "—")}<br>${escapeHtml(s.environment_snapshot?.id || "—")}</td><td>${badge(s.turn_status || s.status)}</td><td>${when(s.updated_at)}</td><td><button class="btn secondary small" data-session="${escapeHtml(s.id)}" type="button">Inspect</button></td></tr>`).join("")}</tbody></table></div>` : empty("No sessions", "Create a session to begin an auditable conversation."))}</div>`;
+    return `<div class="view" data-testid="sessions-view">${heading("COLLABORATION / 03", "Sessions", "A session binds an agent, environment and optional Vault references.", `<button class="btn secondary" data-action="refresh" type="button">Refresh</button><button class="btn" data-modal="session" type="button" ${!d.agents.length || !d.environments.length ? "disabled" : ""}>Create session</button>`)}${!d.agents.length || !d.environments.length ? `<p class="secret-note">Create at least one agent and environment in Runtime before opening a session.</p>` : ""}${panel("Session register", rows.length ? `<div class="table-wrap"><table class="data-table" aria-label="Session register"><thead><tr><th scope="col">Session</th><th scope="col">Agent / environment</th><th scope="col">Turn</th><th scope="col">Last activity</th><th scope="col">Actions</th></tr></thead><tbody>${rows.map((s) => `<tr><td>${id(s.id)}</td><td class="mono">${escapeHtml(s.agent_snapshot?.id || "—")}<br>${escapeHtml(s.environment_snapshot?.id || "—")}</td><td>${badge(s.turn_status || s.status)}</td><td>${when(s.updated_at)}</td><td><a class="btn secondary small" href="${routeUrl("sessions", s.id)}" data-session="${escapeHtml(s.id)}">Open workspace</a></td></tr>`).join("")}</tbody></table></div>` : empty("No sessions", "Create a session to begin an auditable conversation."))}</div>`;
   }
   function governanceView() {
     const d = state.data.governance;
@@ -521,13 +558,15 @@
       focusSelector,
     );
   }
-  function closeDialog({ restoreFocus = true } = {}) {
+  function closeDialog({ restoreFocus = true, syncRoute = true } = {}) {
     dialogEpoch += 1;
     const returnFocus = dialogReturnFocus;
     dialogRoot.innerHTML = "";
     dialogFocusSelector = null;
     setBackgroundInert(false);
     dialogReturnFocus = null;
+    if (syncRoute && state.view === "sessions" && state.sessionId)
+      writeRoute("sessions");
     if (restoreFocus && returnFocus?.isConnected) returnFocus.focus();
   }
   function dialogError(form, message) {
@@ -811,7 +850,12 @@
       await loadView();
     }
   }
-  async function inspectSession(sessionId) {
+  async function inspectSession(sessionId, { syncRoute = true } = {}) {
+    if (syncRoute) writeRoute("sessions", sessionId);
+    else {
+      state.view = "sessions";
+      state.sessionId = sessionId;
+    }
     const epoch = ++dialogEpoch;
     modal(
       "Session evidence",
@@ -819,25 +863,21 @@
       "#dialog-title",
     );
     try {
-      const base = `/api/v1/sessions/${encodeURIComponent(sessionId)}`;
-      const [session, events, artifacts, usage, pending, audit] =
-        await Promise.all([
-          api(base),
-          api(`${base}/events`),
-          api(`${base}/artifacts`),
-          api(`${base}/usage`),
-          api(`${base}/pending-actions`),
-          api(`${base}/audit`),
-        ]);
+      const workspace = await api(
+        `/api/v1/admin/sessions/${encodeURIComponent(sessionId)}/workspace`,
+      );
       if (epoch !== dialogEpoch || !state.token) return;
-      const E = listData(events),
-        A = listData(artifacts),
-        U = listData(usage),
-        P = listData(pending),
-        X = listData(audit);
-      const executableTools = (state.data.sessions?.tools || []).filter(
+      const session = workspace.session,
+        E = workspace.events || [],
+        A = workspace.artifacts || [],
+        U = workspace.usage || [],
+        P = workspace.pending_actions || [],
+        X = workspace.audit || [];
+      const executableTools = (workspace.tools || []).filter(
         (tool) => tool.executable,
       );
+      const messageDraft =
+        sessionStorage.getItem(`${DRAFT_KEY_PREFIX}${sessionId}`) || "";
       const usageSummary = U.reduce(
         (total, record) => ({
           tokenInput: total.tokenInput + Number(record.token_input || 0),
@@ -870,7 +910,7 @@
         ? `<ul class="list">${X.map((record) => `<li><details class="event-details"><summary>${escapeHtml(record.action || record.id)} · ${when(record.created_at)}</summary><pre>${escapeHtml(JSON.stringify({ actor: record.actor, target_type: record.target_type, target_id: record.target_id, request_id: record.request_id }, null, 2))}</pre></details></li>`).join("")}</ul>`
         : empty("No audit records", "Control-plane actions will be recorded here.");
       renderDialog(
-        `<div class="drawer-backdrop" role="presentation"><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="session-dialog-title" data-testid="session-drawer" data-session-id="${escapeHtml(session.id)}"><div class="dialog-head"><div><div class="eyebrow">SESSION TRACE</div><h2 id="session-dialog-title" tabindex="-1">${id(session.id)}</h2></div><button class="icon-btn" data-action="close-dialog" aria-label="Close session details" type="button">×</button></div><p>${badge(session.turn_status || session.status)} <span class="micro">Agent ${escapeHtml(session.agent_snapshot?.id || "—")} · Environment ${escapeHtml(session.environment_snapshot?.id || "—")}</span></p><section class="panel"><h3>Send user message</h3><form id="message-form" class="form-stack" novalidate><div class="dialog-error" data-dialog-error role="alert" hidden></div><label class="field">Message<textarea name="message" required></textarea></label><button class="btn" type="submit">Queue governed turn</button></form></section><section class="panel"><h3>Request governed tool</h3>${executableTools.length ? `<form id="tool-form" class="form-stack" novalidate><div class="dialog-error" data-dialog-error role="alert" hidden></div><label class="field">Tool<select name="tool" required><option value="">Select an implemented tool…</option>${toolOptions}</select></label><p class="micro">The selected tool follows its effective policy. Use Governance to set an implemented tool to <code>always_ask</code> when demonstrating approvals.</p><label class="field">Arguments (JSON object)<textarea name="args" required>{}</textarea></label><button class="btn secondary" type="submit">Submit tool request</button></form>` : `<p class="micro">No executable tools are available for this session.</p>`}</section><section class="panel"><h3>Timeline</h3>${timeline}</section><section class="panel"><h3>Pending actions</h3>${actions}</section><section class="panel"><h3>Evidence & usage</h3><p class="micro">${A.length} artifact(s), ${U.length} usage record(s), ${X.length} audit record(s).</p><dl class="usage-summary"><div><dt>Input tokens</dt><dd>${escapeHtml(usageSummary.tokenInput)}</dd></div><div><dt>Output tokens</dt><dd>${escapeHtml(usageSummary.tokenOutput)}</dd></div><div><dt>Tool duration</dt><dd>${escapeHtml(usageSummary.duration)} ms</dd></div><div><dt>Sandbox CPU</dt><dd>${escapeHtml(usageSummary.cpu)} ms</dd></div><div><dt>Peak memory</dt><dd>${escapeHtml(usageSummary.memory)} MB</dd></div></dl>${A.length ? `<ul class="list">${A.map((a) => `<li class="row"><div class="row-main"><strong>${escapeHtml(a.name || a.id)}</strong><small>${escapeHtml(a.content_type || "artifact")} · ${escapeHtml(a.size || 0)} bytes</small></div><button class="btn secondary small" type="button" data-artifact-download="${escapeHtml(a.id)}" data-download-path="/api/v1/artifacts/${encodeURIComponent(a.id)}/content" data-artifact-name="${escapeHtml(a.name || a.id)}">Download</button></li>`).join("")}</ul>` : empty("No artifacts", "Worker-created artifacts will appear here.")}</section><section class="panel"><h3>Audit trail</h3>${auditTrail}</section></aside></div>`,
+        `<div class="drawer-backdrop" role="presentation"><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="session-dialog-title" data-testid="session-drawer" data-session-id="${escapeHtml(session.id)}"><div class="dialog-head"><div><div class="eyebrow">SESSION WORKSPACE</div><h2 id="session-dialog-title" tabindex="-1">${id(session.id)}</h2></div><button class="icon-btn" data-action="close-dialog" aria-label="Close session details" type="button">×</button></div><p class="session-context">${badge(session.turn_status || session.status)} <span class="micro">Agent ${escapeHtml(session.agent_snapshot?.id || "—")} · Environment ${escapeHtml(session.environment_snapshot?.id || "—")}</span></p><p class="micro read-model-note">Timeline, approvals, evidence, usage, and audit are loaded from one authenticated session workspace contract.</p><section class="panel composer-panel"><h3>Send user message</h3><form id="message-form" class="form-stack" novalidate><div class="dialog-error" data-dialog-error role="alert" hidden></div><label class="field">Message<textarea name="message" required>${escapeHtml(messageDraft)}</textarea></label><button class="btn" type="submit">Queue governed turn</button><p class="micro">Draft saved in this browser session · Cmd/Ctrl+Enter to queue</p></form></section><section class="panel"><h3>Request governed tool</h3>${executableTools.length ? `<form id="tool-form" class="form-stack" novalidate><div class="dialog-error" data-dialog-error role="alert" hidden></div><label class="field">Tool<select name="tool" required><option value="">Select an implemented tool…</option>${toolOptions}</select></label><p class="micro">The selected tool follows its effective policy. Use Governance to set an implemented tool to <code>always_ask</code> when demonstrating approvals.</p><label class="field">Arguments (JSON object)<textarea name="args" required>{}</textarea></label><button class="btn secondary" type="submit">Submit tool request</button></form>` : `<p class="micro">No executable tools are available for this session.</p>`}</section><section class="panel"><h3>Timeline</h3>${timeline}</section><section class="panel"><h3>Pending actions</h3>${actions}</section><section class="panel"><h3>Evidence & usage</h3><p class="micro">${A.length} artifact(s), ${U.length} usage record(s), ${X.length} audit record(s).</p><dl class="usage-summary"><div><dt>Input tokens</dt><dd>${escapeHtml(usageSummary.tokenInput)}</dd></div><div><dt>Output tokens</dt><dd>${escapeHtml(usageSummary.tokenOutput)}</dd></div><div><dt>Tool duration</dt><dd>${escapeHtml(usageSummary.duration)} ms</dd></div><div><dt>Sandbox CPU</dt><dd>${escapeHtml(usageSummary.cpu)} ms</dd></div><div><dt>Peak memory</dt><dd>${escapeHtml(usageSummary.memory)} MB</dd></div></dl>${A.length ? `<ul class="list">${A.map((a) => `<li class="row"><div class="row-main"><strong>${escapeHtml(a.name || a.id)}</strong><small>${escapeHtml(a.content_type || "artifact")} · ${escapeHtml(a.size || 0)} bytes</small></div><button class="btn secondary small" type="button" data-artifact-download="${escapeHtml(a.id)}" data-download-path="/api/v1/artifacts/${encodeURIComponent(a.id)}/content" data-artifact-name="${escapeHtml(a.name || a.id)}">Download</button></li>`).join("")}</ul>` : empty("No artifacts", "Worker-created artifacts will appear here.")}</section><section class="panel"><h3>Audit trail</h3>${auditTrail}</section></aside></div>`,
         "#session-dialog-title",
       );
     } catch (error) {
@@ -913,6 +953,7 @@
         method: "POST",
         body: { type: "user.message", payload: { text: String(text) } },
       });
+      sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${sessionId}`);
       form.reset();
       toast("User message accepted and a governed turn was queued.");
       inspectSession(sessionId);
@@ -1024,9 +1065,27 @@
         if (field) field.hidden = !delayed;
         if (input) input.required = delayed;
       });
-    dialogRoot.querySelector("#message-form")?.addEventListener("submit", (event) => {
+    const messageForm = dialogRoot.querySelector("#message-form");
+    messageForm?.addEventListener("submit", (event) => {
       event.preventDefault();
       sendMessage(event.currentTarget);
+    });
+    const messageInput = messageForm?.querySelector("textarea[name=message]");
+    messageInput?.addEventListener("input", (event) => {
+      const sessionId = dialogRoot.querySelector(
+        "[data-testid=session-drawer]",
+      )?.dataset.sessionId;
+      if (sessionId)
+        sessionStorage.setItem(
+          `${DRAFT_KEY_PREFIX}${sessionId}`,
+          event.currentTarget.value,
+        );
+    });
+    messageInput?.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        messageForm.requestSubmit();
+      }
     });
     dialogRoot.querySelector("#tool-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1061,7 +1120,9 @@
           sessionStorage.setItem(TOKEN_KEY, state.token);
           state.overview = null;
           render();
-          loadView();
+          await loadView();
+          if (state.view === "sessions" && state.sessionId)
+            inspectSession(state.sessionId, { syncRoute: false });
         } catch (error) {
           state.token = "";
           input.value = "";
@@ -1070,9 +1131,10 @@
         }
       });
     document.querySelectorAll("[data-view]").forEach((b) =>
-      b.addEventListener("click", () => {
-        state.view = b.dataset.view;
-        sessionStorage.setItem(VIEW_KEY, state.view);
+      b.addEventListener("click", (event) => {
+        event.preventDefault();
+        closeDialog({ restoreFocus: false, syncRoute: false });
+        writeRoute(event.currentTarget.dataset.view);
         document.querySelector(".sidebar")?.classList.remove("open");
         document.querySelector("#mobile-nav")?.setAttribute("aria-expanded", "false");
         render();
@@ -1139,7 +1201,8 @@
     document
       .querySelectorAll("[data-session]")
       .forEach((b) =>
-        b.addEventListener("click", () => {
+        b.addEventListener("click", (event) => {
+          event.preventDefault();
           dialogReturnFocus = b;
           inspectSession(b.dataset.session);
         }),
@@ -1174,7 +1237,23 @@
       first.focus();
     }
   });
+  window.addEventListener("popstate", async () => {
+    const route = readRoute();
+    closeDialog({ restoreFocus: false, syncRoute: false });
+    state.view = route.view || "overview";
+    state.sessionId = route.sessionId;
+    render();
+    if (!state.token) return;
+    await loadView();
+    if (state.view === "sessions" && state.sessionId)
+      inspectSession(state.sessionId, { syncRoute: false });
+  });
   if (!views.includes(state.view)) state.view = "overview";
+  writeRoute(state.view, state.sessionId, { replace: true });
   render();
-  if (state.token) loadView();
+  if (state.token)
+    loadView().then(() => {
+      if (state.view === "sessions" && state.sessionId)
+        inspectSession(state.sessionId, { syncRoute: false });
+    });
 })();
