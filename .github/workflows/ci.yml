@@ -54,11 +54,16 @@ jobs:
           test ! -f /tmp/cloudagent-wheel-unpack/cloudagent_platform/admin.py
           python -m pip install --no-deps --no-compile --target /tmp/cloudagent-wheel-site "${wheel_path}"
           PYTHONPATH=/tmp/cloudagent-wheel-site python - <<'PY'
+          import re
+          from pathlib import Path
+
           from cloudagent_platform import __version__
           from cloudagent_platform.console import get_console_asset
           from cloudagent_platform.openapi import current_openapi
 
-          assert __version__ == "0.2.0"
+          pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
+          expected = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE).group(1)
+          assert __version__ == expected, (__version__, expected)
           assert current_openapi()["info"]["version"] == __version__
           asset = get_console_asset("/admin/assets/console.js")
           assert asset is not None and len(asset.content) > 1_000
