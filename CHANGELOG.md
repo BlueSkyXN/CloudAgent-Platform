@@ -2,7 +2,7 @@
 
 All notable changes to CloudAgent-Platform are documented here.
 
-## Unreleased
+## 0.3.0 - 2026-07-25
 
 ### Changed
 
