@@ -92,7 +92,7 @@ build_runtime_snapshot
 bash "${repo_root}/cloud/hfs/start.sh" >"${tmp_dir}/server.log" 2>&1 &
 server_pid="$!"
 
-if ! python3 - "${port}" "${CLOUDAGENT_AUTH_TOKEN}" "${server_pid}" "${startup_timeout_seconds}" <<'PY'
+if ! python3 - "${port}" "${CLOUDAGENT_AUTH_TOKEN}" "${server_pid}" "${startup_timeout_seconds}" "${runtime_version}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -102,7 +102,7 @@ import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-port, token, server_pid, startup_timeout = sys.argv[1:]
+port, token, server_pid, startup_timeout, expected_version = sys.argv[1:]
 base_url = f"http://127.0.0.1:{port}"
 
 try:
@@ -183,7 +183,7 @@ assert readiness["status"] == "ready", readiness
 
 status, spec = request("/openapi.json")
 assert status == 200, spec
-assert spec["info"]["version"] == "0.2.0", spec["info"]
+assert spec["info"]["version"] == expected_version, spec["info"]
 
 status, console = request("/admin")
 assert status == 200, console

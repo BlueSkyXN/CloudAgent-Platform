@@ -5,11 +5,10 @@ It combines scheduling, session/event handling, worker leases, runtime policy,
 tool approvals, artifacts, usage evidence, Vault references, and a responsive
 operator console in one dependency-free Python service.
 
-`v0.2.0` is a published **company-showcase release** for the local runtime. It
+`v0.3.0` is the current **company-showcase release** for the local runtime. It
 demonstrates a complete, honest execution loop; it does not claim production
 multi-tenant isolation, a hardened remote worker fleet, or runtime secret
-injection. Current hardening work is tracked as **Unreleased** until it passes
-the same immutable release gate and is published under a new version.
+injection.
 
 ## What the Showcase Proves
 

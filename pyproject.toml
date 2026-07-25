@@ -1,6 +1,6 @@
 [project]
 name = "cloudagent-platform"
-version = "0.2.0"
+version = "0.3.0"
 description = "Governed cloud Agent runtime control plane and showcase console."
 requires-python = ">=3.11"
 dependencies = []
