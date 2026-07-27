@@ -1,6 +1,7 @@
+contract_schema=2
+lane=source
+version_source=commit
 source_repo=https://github.com/BlueSkyXN/CloudAgent-Platform.git
-source_path=cloud/hfs
+source_commit=a82b11d9a13b382c0f903eb83314d260a28aee2e
+wrapper_source_path=cloud/hfs
 bundle_generated_at=source-tree-placeholder
-mode=bucket-mounted-runtime
-runtime_bucket=BlueSkyXN/cloudagent-platform-hfs-runtime
-runtime_mount=/mnt/cloudagent-runtime

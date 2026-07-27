@@ -1,55 +1,17 @@
-schema_version = 1
-standard = "hfs-dev"
-pattern = "A"
-runtime_mode = "bucket-mounted-runtime"
-space_root_mode = "flat-remap"
-hfs_dir = "cloud/hfs"
-export_command = "bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space"
-public_port = 7860
-canonical_health_endpoint = "/_ops/healthz"
-readiness_endpoint = "/_ops/readyz"
-release_pin_required = true
-required_files = [
-  "README.md",
-  "Dockerfile",
-  ".dockerignore",
-  "app.py",
-  "start.sh",
-  "healthcheck.sh",
-  "hfs-dev.toml",
-  "BUILD_SOURCE.txt",
-  "BUNDLE_MANIFEST.json",
+standard = "2.0"
+project = "cloudagent-platform"
+space = "BlueSkyXN/cloudagent-platform-hfs-20260616"
+sovereignty = "sovereign"
+lane = "source"
+version_source = "commit"
+
+# Local control-plane credentials; never sent to the Space.
+local_only = ["HF_TOKEN", "GH_TOKEN"]
+
+# Key names only. CLOUDAGENT_AUTH_TOKEN is required at runtime.
+secrets = ["CLOUDAGENT_AUTH_TOKEN"]
+variables = []
+
+deviations = [
+  "name-no-date = 历史 Space slug 含日期；是否迁移至无日期 slug 仍待 owner 确认。",
 ]
-source_excludes = [
-  ".git",
-  ".gitattributes",
-  ".env",
-  ".env.local",
-  "local",
-  "data",
-  "logs",
-  "dist",
-  "node_modules",
-  "__pycache__",
-]
-
-[[health_surfaces]]
-name = "health"
-path = "/_ops/healthz"
-required_for_live_smoke = true
-
-[[health_surfaces]]
-name = "readiness"
-path = "/_ops/readyz"
-required_for_live_smoke = true
-
-[[health_surfaces]]
-name = "system-info"
-path = "/api/v1/system/info"
-required_for_live_smoke = true
-requires_bearer_auth = true
-
-[[health_surfaces]]
-name = "sdlc-status"
-path = "/api/v1/sdlc/status"
-required_for_live_smoke = true

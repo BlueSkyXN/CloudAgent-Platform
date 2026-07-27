@@ -11,71 +11,63 @@ pinned: false
 
 # CloudAgent-Platform HFS
 
-This Space is the CloudAgent-Platform Hugging Face Docker Space deployment.
+This flat Hugging Face Docker Space wrapper builds the public CloudAgent source
+at an immutable Git commit. The Space repository contains deployment files only;
+product source is fetched during the Docker build and is never exported into the
+Space root.
 
-It runs a pinned CloudAgent runtime release from a Hugging Face bucket mounted
-into the Docker Space. The Space repository remains a flat wrapper; product
-source is mounted at runtime instead of being copied into the Space root.
+## Source contract
 
-Runtime contract:
+- Lane: `source`; version source: full 40-character Git commit SHA.
+- The exported `Dockerfile`, `BUILD_SOURCE.txt`, and `BUNDLE_MANIFEST.json` bind
+  the same `source_commit` from
+  `https://github.com/BlueSkyXN/CloudAgent-Platform.git`.
+- Docker fetches that commit, checks out detached `HEAD`, and rejects any mismatch
+  before it starts the product package.
+- The public port is `7860`. `/_ops/healthz`, `/_ops/readyz`, and `/openapi.json`
+  remain public operational surfaces; `/api/v1/*` retains its Bearer-token
+  boundary, including `/api/v1/system/info` and the operator Console APIs.
+- `CLOUDAGENT_AUTH_TOKEN` is the sole required Space Secret. Register key names
+  only; never put values in this wrapper or its source repository.
 
-- Docker Space starts on port `7860`.
-- Source bucket is mounted read-only at `/mnt/cloudagent-runtime`, with each
-  release under `releases/v<version>-<git-sha>/`.
-- `CLOUDAGENT_RUNTIME_RELEASE`, `CLOUDAGENT_RUNTIME_VERSION`, and
-  `CLOUDAGENT_RUNTIME_GIT_SHA` must select the same immutable release.
-- `CLOUDAGENT_AUTH_TOKEN` must be configured as a Hugging Face Space Secret.
-- `/_ops/healthz`, `/_ops/readyz`, and `/openapi.json` are public operational
-  surfaces.
-- `/api/v1/*` application routes keep the runtime bearer-token boundary.
-- Runtime releases at `0.2.0` or later expose the package-owned operator
-  Console at `/admin` with same-origin CSS/JS/SVG assets. The Console does not
-  embed the Space secret and still requires the runtime Bearer token.
+## Persistence and readiness
 
-Startup verifies the selected `RUNTIME_MANIFEST.json` version, Git SHA, and all
-file hashes before serving traffic, copies the verified release into the
-container's ephemeral `/tmp`, then verifies that copied inventory again.
-Deployment truth is read from both the Space wrapper SHA and the selected bucket
-manifest; a `RUNNING` Space alone does not prove that the mounted runtime
-matches the intended release.
+The control plane continues to use SQLite. Startup requires the Space persistent
+storage mount to provide an existing writable `/data` directory, initializes its
+application directory below that mount, and uses
+`/data/cloudagent/cloudagent-platform.sqlite3` by default. A missing, symlinked,
+or non-writable mount, an invalid source checkout, a missing secret, or a failed
+SQLite read/write probe stops startup; there is no ephemeral or probe-server
+fallback.
 
-## HFS Contract
+The package itself owns schema initialization and existing persistence behavior.
+Production backup, restart persistence, and isolated restore evidence remain
+owner-gated runtime verification, not assertions supplied by this repository.
 
-- SDK: Docker
-- Public port: `7860`
-- Canonical health endpoint: `/_ops/healthz`
-- Readiness endpoint: `/_ops/readyz`
-- Runtime mode: `bucket-mounted-runtime`
-- Runtime source mount: `hf://buckets/BlueSkyXN/cloudagent-platform-hfs-runtime:/mnt/cloudagent-runtime:ro`
-- Runtime release pin: `releases/v<version>-<git-sha>/` plus matching Space
-  variables `CLOUDAGENT_RUNTIME_RELEASE`, `CLOUDAGENT_RUNTIME_VERSION`, and
-  `CLOUDAGENT_RUNTIME_GIT_SHA`
-- Export provenance: `BUILD_SOURCE.txt` and `BUNDLE_MANIFEST.json`
-- Export command:
+## Export and checks
+
+Create a flat wrapper only from a clean commit:
 
 ```bash
 bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space
+python3 cloud/hfs/validate_source_wrapper.py
 ```
 
-Local release candidates also simulate the read-only runtime mount and start
-the real package through the wrapper before any publish decision:
+The validator checks the source-pin handoff, flat export boundary, generated
+provenance, health-check wiring, and bootstrap fail-closed guards. The exporter
+stages its output in a fresh sibling directory and renames it only after the
+inventory and denylist checks pass, so a failed export leaves no publishable
+partial bundle. It does not build Docker or contact GitHub/Hugging Face. For a
+local uncommitted review only, pass `--allow-dirty-export`; such a bundle is
+explicitly non-release.
 
-```bash
-bash cloud/hfs/smoke_mounted_runtime.sh
-```
+Docker build, Space deployment, remote readback, live health/auth smoke, SQLite
+restart persistence, and backup/restore checks require an approved environment
+and are intentionally not performed by this local wrapper contract.
 
-Build the bucket artifact only from a clean commit:
+## Owner decisions retained
 
-```bash
-bash cloud/hfs/build_runtime_snapshot.sh /tmp/cloudagent-runtime
-```
-
-Sync the resulting `releases/<release-id>/` directory without replacing prior
-releases. Roll back by pointing the three Space pin variables at a previously
-verified release directory, restarting the Space, and re-reading its manifest
-and health surfaces.
-
-## Source
-
-Primary planning source: `local/20260616` in
-<https://github.com/BlueSkyXN/CloudAgent-Platform>.
+- Define the observed source-build duration/resource threshold that would allow a
+  future artifact-lane reclassification.
+- Decide whether to replace the historical dated Space slug.
+- Decide the retention and decommission plan for the previous runtime bucket.

@@ -1,40 +1,40 @@
 from __future__ import annotations
 
 import json
-import re
-import shutil
+import os
 import subprocess
 import tempfile
+import tomllib
 import unittest
+import importlib.util
 from pathlib import Path
 
 from cloudagent_platform.openapi import current_openapi
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+HFS_ROOT = REPO_ROOT / "cloud" / "hfs"
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options"}
+
+_PERSISTENT_PATH_SPEC = importlib.util.spec_from_file_location(
+    "validate_persistent_path", HFS_ROOT / "validate_persistent_path.py"
+)
+assert _PERSISTENT_PATH_SPEC and _PERSISTENT_PATH_SPEC.loader
+_PERSISTENT_PATH = importlib.util.module_from_spec(_PERSISTENT_PATH_SPEC)
+_PERSISTENT_PATH_SPEC.loader.exec_module(_PERSISTENT_PATH)
 
 
 class OpenAPIReleaseContractTests(unittest.TestCase):
-    def clone_with_current_hfs_scripts(self, directory: str) -> Path:
-        clone = Path(directory) / "clone"
-        subprocess.run(
-            ["git", "clone", "--quiet", "--no-hardlinks", str(REPO_ROOT), str(clone)],
-            check=True,
-        )
-        for name in ("export_space_bundle.sh", "build_runtime_snapshot.sh"):
-            shutil.copy2(
-                REPO_ROOT / "cloud/hfs" / name,
-                clone / "cloud/hfs" / name,
-            )
-        return clone
-
     def test_each_operation_has_stable_contract_basics(self) -> None:
         spec = current_openapi()
         self.assertEqual(spec["openapi"], "3.1.0")
         operation_ids: set[str] = set()
         for path, path_item in spec["paths"].items():
-            expected_parameters = set(re.findall(r"\{([^}]+)\}", path))
+            expected_parameters = {
+                segment[1:-1]
+                for segment in path.split("/")
+                if segment.startswith("{") and segment.endswith("}")
+            }
             defined_parameters = {
                 parameter["name"]
                 for parameter in path_item.get("parameters", [])
@@ -83,13 +83,12 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
 
     def test_local_references_resolve(self) -> None:
         spec = current_openapi()
-        root = spec
 
         def walk(value: object) -> None:
             if isinstance(value, dict):
                 reference = value.get("$ref")
                 if isinstance(reference, str) and reference.startswith("#/"):
-                    target: object = root
+                    target: object = spec
                     for part in reference[2:].split("/"):
                         self.assertIsInstance(target, dict, reference)
                         target = target[part]
@@ -107,55 +106,69 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
         self.assertIn("const canRegister = inboundWebhook || Boolean(i.base_url)", console)
         self.assertIn("Webhook is inbound-only and does not use one", console)
 
-    def test_export_rejects_a_dirty_tree_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            clone = self.clone_with_current_hfs_scripts(directory)
-            readme = clone / "README.md"
-            readme.write_text(readme.read_text(encoding="utf-8") + "\n", encoding="utf-8")
-            result = subprocess.run(
-                ["bash", "cloud/hfs/export_space_bundle.sh", str(Path(directory) / "bundle")],
-                cwd=clone,
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
-            self.assertIn("refusing Space export from dirty working tree", result.stderr)
+    def test_hfs_registry_is_source_lane_and_registers_only_real_setting_names(self) -> None:
+        manifest = tomllib.loads((HFS_ROOT / "hfs-dev.toml").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["standard"], "2.0")
+        self.assertEqual(manifest["lane"], "source")
+        self.assertEqual(manifest["version_source"], "commit")
+        self.assertEqual(manifest["secrets"], ["CLOUDAGENT_AUTH_TOKEN"])
+        self.assertEqual(manifest["variables"], [])
 
-    def test_runtime_snapshot_builder_rejects_a_dirty_tree_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            clone = self.clone_with_current_hfs_scripts(directory)
-            readme = clone / "README.md"
-            readme.write_text(readme.read_text(encoding="utf-8") + "\n", encoding="utf-8")
-            result = subprocess.run(
-                ["bash", "cloud/hfs/build_runtime_snapshot.sh", str(Path(directory) / "runtime")],
-                cwd=clone,
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
-            self.assertIn("refusing runtime snapshot from dirty working tree", result.stderr)
+    def test_hfs_source_wrapper_static_contract(self) -> None:
+        result = subprocess.run(
+            ["python3", str(HFS_ROOT / "validate_source_wrapper.py"), "--allow-dirty-export"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("HFS source-wrapper contract passed", result.stdout)
 
-    def test_runtime_snapshot_builder_rejects_a_release_id_with_the_wrong_version(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            clone = self.clone_with_current_hfs_scripts(directory)
-            git_sha = subprocess.check_output(
-                ["git", "rev-parse", "--verify", "HEAD"],
-                cwd=clone,
-                text=True,
-            ).strip()
+    def test_exporter_refuses_to_overwrite_an_existing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
             result = subprocess.run(
-                [
-                    "bash",
-                    "cloud/hfs/build_runtime_snapshot.sh",
-                    str(Path(directory) / "runtime"),
-                    f"v9.9.9-{git_sha}",
-                ],
-                cwd=clone,
+                ["bash", str(HFS_ROOT / "export_space_bundle.sh"), temporary],
+                cwd=REPO_ROOT,
+                env={**os.environ, "CLOUDAGENT_ALLOW_DIRTY_EXPORT": "true"},
                 text=True,
                 capture_output=True,
             )
-            self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
-            self.assertIn("release id must equal", result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing existing export target", result.stderr)
+
+    def test_persistent_database_rejects_any_symlink_component(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "data" / "cloudagent"
+            outside = Path(temporary) / "outside"
+            root.mkdir(parents=True)
+            outside.mkdir()
+            (root / "nested").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(ValueError, "symlink component"):
+                _PERSISTENT_PATH.validate(root / "nested" / "cloudagent.sqlite3", root)
+
+    def test_retired_snapshot_builder_fails_closed(self) -> None:
+        result = subprocess.run(
+            ["bash", str(HFS_ROOT / "build_runtime_snapshot.sh"), "/not-used"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 64)
+        self.assertIn("retired", result.stderr)
+
+    def test_hfs_provenance_placeholders_remain_source_contracts(self) -> None:
+        build_source = dict(
+            line.split("=", 1)
+            for line in (HFS_ROOT / "BUILD_SOURCE.txt").read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        bundle = json.loads((HFS_ROOT / "BUNDLE_MANIFEST.json").read_text(encoding="utf-8"))
+        self.assertEqual(build_source["lane"], "source")
+        self.assertEqual(build_source["version_source"], "commit")
+        self.assertRegex(build_source["source_commit"], r"^[0-9a-f]{40}$")
+        self.assertEqual(bundle["schema_version"], 2)
+        self.assertEqual(bundle["source_commit"], build_source["source_commit"])
 
 
 if __name__ == "__main__":

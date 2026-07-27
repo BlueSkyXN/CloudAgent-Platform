@@ -1,4 +1,5 @@
 /.playwright-mcp
+/.env
 __pycache__/
 *.py[cod]
 .DS_Store
@@ -7,3 +8,11 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+
+# HFS/local deployment values and review material.
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/config.toml
+/local/
