@@ -135,17 +135,13 @@ def check_source_files() -> None:
         fail("legacy deployment probe must remain retired and non-runnable")
 
 
-def check_export(allow_dirty_export: bool) -> None:
+def check_export() -> None:
     source_commit = current_commit()
     with tempfile.TemporaryDirectory(prefix="cloudagent-hfs-contract-") as temporary:
         out_dir = Path(temporary) / "space"
-        environment = dict(os.environ)
-        if allow_dirty_export:
-            environment["CLOUDAGENT_ALLOW_DIRTY_EXPORT"] = "true"
         result = subprocess.run(
             ["bash", str(HFS_ROOT / "export_space_bundle.sh"), str(out_dir)],
             cwd=REPO_ROOT,
-            env=environment,
             capture_output=True,
             text=True,
         )
@@ -199,17 +195,11 @@ def check_export(allow_dirty_export: bool) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--allow-dirty-export",
-        action="store_true",
-        help="Validate a local non-release export when the working tree is intentionally dirty.",
-    )
-    args = parser.parse_args()
+    argparse.ArgumentParser(description=__doc__).parse_args()
     try:
         check_registry()
         check_source_files()
-        check_export(args.allow_dirty_export)
+        check_export()
     except (AssertionError, OSError, subprocess.CalledProcessError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         print(f"HFS source-wrapper contract failed: {exc}", file=sys.stderr)
         return 1

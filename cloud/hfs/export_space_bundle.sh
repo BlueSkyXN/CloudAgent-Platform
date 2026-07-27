@@ -27,11 +27,8 @@ if ! [[ "${source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
 fi
 
 if [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
-  if [[ "${CLOUDAGENT_ALLOW_DIRTY_EXPORT:-false}" != "true" ]]; then
-    printf 'refusing Space export from dirty working tree; commit or stash changes first\n' >&2
-    exit 65
-  fi
-  printf 'warning: exporting a dirty non-release wrapper bundle; do not publish it as a release\n' >&2
+  printf 'refusing Space export from dirty working tree; commit changes first\n' >&2
+  exit 65
 fi
 
 python3 - "${out_dir}" "${repo_root}" "${hfs_dir}" <<'PY'

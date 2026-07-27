@@ -116,7 +116,7 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
 
     def test_hfs_source_wrapper_static_contract(self) -> None:
         result = subprocess.run(
-            ["python3", str(HFS_ROOT / "validate_source_wrapper.py"), "--allow-dirty-export"],
+            ["python3", str(HFS_ROOT / "validate_source_wrapper.py")],
             cwd=REPO_ROOT,
             text=True,
             capture_output=True,
@@ -129,12 +129,17 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
             result = subprocess.run(
                 ["bash", str(HFS_ROOT / "export_space_bundle.sh"), temporary],
                 cwd=REPO_ROOT,
-                env={**os.environ, "CLOUDAGENT_ALLOW_DIRTY_EXPORT": "true"},
                 text=True,
                 capture_output=True,
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Refusing existing export target", result.stderr)
+
+    def test_exporter_has_no_dirty_provenance_bypass(self) -> None:
+        exporter = (HFS_ROOT / "export_space_bundle.sh").read_text(encoding="utf-8")
+        validator = (HFS_ROOT / "validate_source_wrapper.py").read_text(encoding="utf-8")
+        self.assertNotIn("CLOUDAGENT_ALLOW_DIRTY_EXPORT", exporter)
+        self.assertNotIn("allow-dirty-export", validator)
 
     def test_persistent_database_rejects_any_symlink_component(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

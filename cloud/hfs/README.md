@@ -57,9 +57,9 @@ The validator checks the source-pin handoff, flat export boundary, generated
 provenance, health-check wiring, and bootstrap fail-closed guards. The exporter
 stages its output in a fresh sibling directory and renames it only after the
 inventory and denylist checks pass, so a failed export leaves no publishable
-partial bundle. It does not build Docker or contact GitHub/Hugging Face. For a
-local uncommitted review only, pass `--allow-dirty-export`; such a bundle is
-explicitly non-release.
+partial bundle. It does not build Docker or contact GitHub/Hugging Face. There
+is no dirty-tree bypass: local uncommitted review uses static tests, not an
+export whose bytes could be mistaken for the current commit.
 
 Docker build, Space deployment, remote readback, live health/auth smoke, SQLite
 restart persistence, and backup/restore checks require an approved environment
