@@ -64,6 +64,7 @@ def current_commit() -> str:
 
 def check_registry() -> None:
     manifest = tomllib.loads((HFS_ROOT / "hfs-dev.toml").read_text(encoding="utf-8"))
+    candidate = tomllib.loads((HFS_ROOT / "hfs-dev.candidate.toml").read_text(encoding="utf-8"))
     expected = {
         "standard": "2.0",
         "project": "cloudagent-platform",
@@ -74,6 +75,13 @@ def check_registry() -> None:
     for key, value in expected.items():
         if manifest.get(key) != value:
             fail(f"hfs-dev.toml {key} must be {value!r}")
+    if manifest.get("space") != "BlueSkyXN/cloudagent-platform-hfs":
+        fail("production manifest must use the approved no-date Space id")
+    if candidate.get("space") != "BlueSkyXN/cloudagent-platform-hfs-v2-candidate":
+        fail("candidate manifest must use the fixed private candidate Space id")
+    for key in sorted(set(manifest) | set(candidate)):
+        if key != "space" and manifest.get(key) != candidate.get(key):
+            fail(f"candidate manifest differs from production at {key}")
     if manifest.get("secrets") != ["CLOUDAGENT_AUTH_TOKEN"]:
         fail("hfs-dev.toml must register only CLOUDAGENT_AUTH_TOKEN as a Space Secret")
     if manifest.get("variables") != []:
@@ -192,6 +200,27 @@ def check_export() -> None:
         for forbidden in ("bucket-mounted-runtime", "CLOUDAGENT_RUNTIME_", "/mnt/cloudagent-runtime"):
             if forbidden in "\n".join(path.read_text(encoding="utf-8") for path in out_dir.iterdir() if path.is_file()):
                 fail(f"exported wrapper retains a retired runtime-mount dependency: {forbidden}")
+
+        candidate_dir = Path(temporary) / "candidate-space"
+        candidate_env = os.environ.copy()
+        candidate_env["HFS_MANIFEST"] = "hfs-dev.candidate.toml"
+        candidate_result = subprocess.run(
+            ["bash", str(HFS_ROOT / "export_space_bundle.sh"), str(candidate_dir)],
+            cwd=REPO_ROOT,
+            env=candidate_env,
+            capture_output=True,
+            text=True,
+        )
+        if candidate_result.returncode != 0:
+            fail(f"candidate Space export failed: {candidate_result.stdout}{candidate_result.stderr}")
+        if {path.name for path in candidate_dir.iterdir()} != EXPECTED_EXPORTED_FILES:
+            fail("candidate export does not match the flat wrapper allowlist")
+        candidate_manifest = tomllib.loads((candidate_dir / "hfs-dev.toml").read_text(encoding="utf-8"))
+        if candidate_manifest.get("space") != "BlueSkyXN/cloudagent-platform-hfs-v2-candidate":
+            fail("candidate export did not select hfs-dev.candidate.toml")
+        candidate_provenance = parse_key_values(candidate_dir / "BUILD_SOURCE.txt")
+        if candidate_provenance.get("source_commit") != source_commit:
+            fail("candidate export provenance does not match the wrapper commit")
 
 
 def main() -> int:

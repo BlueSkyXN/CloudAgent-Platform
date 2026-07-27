@@ -69,5 +69,6 @@ and are intentionally not performed by this local wrapper contract.
 
 - Define the observed source-build duration/resource threshold that would allow a
   future artifact-lane reclassification.
-- Decide whether to replace the historical dated Space slug.
+- Keep the historical dated Space as a rollback target during the observation
+  window; the approved production target is `BlueSkyXN/cloudagent-platform-hfs`.
 - Decide the retention and decommission plan for the previous runtime bucket.

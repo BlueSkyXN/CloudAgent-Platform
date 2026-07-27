@@ -4,6 +4,19 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 hfs_dir="${repo_root}/cloud/hfs"
 requested_out_dir="${1:-${TMPDIR:-/tmp}/cloudagent-platform-hfs-space}"
+manifest_name="${HFS_MANIFEST:-hfs-dev.toml}"
+case "${manifest_name}" in
+  hfs-dev.toml|hfs-dev.candidate.toml) ;;
+  *)
+    printf 'HFS_MANIFEST must be hfs-dev.toml or hfs-dev.candidate.toml\n' >&2
+    exit 64
+    ;;
+esac
+manifest_path="${hfs_dir}/${manifest_name}"
+if [[ ! -f "${manifest_path}" ]]; then
+  printf 'selected HFS manifest does not exist: %s\n' "${manifest_name}" >&2
+  exit 64
+fi
 
 canonical_path() {
   python3 - "$1" <<'PY'
@@ -74,7 +87,7 @@ copy_file Dockerfile
 copy_file .dockerignore
 copy_file start.sh
 copy_file healthcheck.sh
-copy_file hfs-dev.toml
+cp "${manifest_path}" "${bundle_dir}/hfs-dev.toml"
 copy_file validate_persistent_path.py
 
 python3 - "${bundle_dir}/Dockerfile" "${source_commit}" <<'PY'

@@ -73,6 +73,7 @@ jobs:
         run: |
           bash -n cloud/hfs/build_runtime_snapshot.sh cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/smoke_source_wrapper.sh cloud/hfs/smoke_mounted_runtime.sh cloud/hfs/start.sh
           bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space-${{ github.run_id }}-${{ matrix.python-version }}
+          HFS_MANIFEST=hfs-dev.candidate.toml bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-candidate-${{ github.run_id }}-${{ matrix.python-version }}
           python3 cloud/hfs/validate_source_wrapper.py
 
       - name: Check whitespace
