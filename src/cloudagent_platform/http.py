@@ -564,8 +564,13 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                 self.respond_error(HTTPStatus.BAD_REQUEST, "invalid_request_error", str(exc), request_id)
 
         def require_auth(self) -> None:
-            auth = self.headers.get("Authorization", "")
-            if not hmac.compare_digest(auth, f"Bearer {runtime.auth_token}"):
+            expected = f"Bearer {runtime.auth_token}"
+            authorization = self.headers.get("Authorization", "")
+            hfs_token = self.headers.get("X-CloudAgent-Token", "")
+            if not (
+                hmac.compare_digest(authorization, expected)
+                or hmac.compare_digest(hfs_token, runtime.auth_token)
+            ):
                 raise PermissionError("missing or invalid bearer token")
 
         def read_json(self) -> dict[str, Any]:
@@ -690,7 +695,7 @@ def make_handler(runtime: Runtime) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Vary", "Origin")
             self.send_header(
                 "Access-Control-Allow-Headers",
-                "Authorization, Content-Type, X-Request-Id, X-CloudAgent-Webhook-Token",
+                "Authorization, Content-Type, X-Request-Id, X-CloudAgent-Token, X-CloudAgent-Webhook-Token",
             )
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("X-Content-Type-Options", "nosniff")

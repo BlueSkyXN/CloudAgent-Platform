@@ -59,6 +59,15 @@ Protected endpoints expect:
 Authorization: Bearer dev-local-token
 ```
 
+For direct CLI smoke against a private Hugging Face Space, keep the Hugging
+Face gateway token in `Authorization` and pass the application token in the
+dedicated header instead:
+
+```http
+Authorization: Bearer <hf-gateway-token>
+X-CloudAgent-Token: <cloudagent-auth-token>
+```
+
 The default development token is accepted only for localhost binding. A
 non-loopback bind requires `CLOUDAGENT_AUTH_TOKEN` or `--auth-token`.
 

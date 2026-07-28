@@ -109,6 +109,24 @@ class LocalPrototypeTest(unittest.TestCase):
         self.assertIsInstance(payload, dict)
         self.assertEqual(payload["error"]["type"], "authentication_error")
 
+        status, kernels = self.request(
+            "GET",
+            "/api/v1/kernels",
+            token=None,
+            extra_headers={"X-CloudAgent-Token": "test-token"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIsInstance(kernels, dict)
+
+        status, payload = self.request(
+            "GET",
+            "/api/v1/kernels",
+            token=None,
+            extra_headers={"X-CloudAgent-Token": "wrong-token"},
+        )
+        self.assertEqual(status, 401)
+        self.assertIsInstance(payload, dict)
+
         status, kernels = self.request("GET", "/api/v1/kernels")
         self.assertEqual(status, 200)
         self.assertIsInstance(kernels, dict)
