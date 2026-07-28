@@ -215,29 +215,35 @@ control-plane/execution-plane boundary.
 Run the release hardening gate:
 
 ```bash
-python3 -m py_compile src/cloudagent_platform/*.py tests/*.py
+python3 -m py_compile src/cloudagent_platform/*.py tests/*.py cloud/hfs/validate_source_wrapper.py
 PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests
 node --check src/cloudagent_platform/web/console.js
 python3 -m pip wheel . --no-deps --wheel-dir /tmp/cloudagent-wheel
-bash -n cloud/hfs/build_runtime_snapshot.sh cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/start.sh cloud/hfs/smoke_mounted_runtime.sh
+bash -n cloud/hfs/build_runtime_snapshot.sh cloud/hfs/export_space_bundle.sh cloud/hfs/healthcheck.sh cloud/hfs/smoke_source_wrapper.sh cloud/hfs/smoke_mounted_runtime.sh cloud/hfs/start.sh
 bash cloud/hfs/export_space_bundle.sh /tmp/cloudagent-platform-hfs-space
-bash cloud/hfs/smoke_mounted_runtime.sh
+python3 cloud/hfs/validate_source_wrapper.py
 git diff --check
 ```
 
-CI repeats the Python matrix, JavaScript syntax, wheel, HFS wrapper export, and
-mounted-runtime startup smoke checks on pushes to `main` and pull requests.
+CI repeats the Python matrix, JavaScript syntax, wheel, and HFS source-wrapper
+export/provenance contract checks on pushes to `main` and pull requests. It does
+not run a Docker build because that build fetches the public source commit.
 
 ## Deployment
 
-`cloud/hfs/` is the Hugging Face Docker Space wrapper. It is deployment
-packaging rather than product source, exports a flat safe Space root, and starts
-only an immutable, manifest-verified runtime release from the mounted runtime
-bucket. Build a release snapshot from a clean commit with
-`bash cloud/hfs/build_runtime_snapshot.sh /tmp/cloudagent-runtime`, sync its
-`releases/v<version>-<git-sha>/` directory, then configure the Space with the
-matching `CLOUDAGENT_RUNTIME_RELEASE`, `CLOUDAGENT_RUNTIME_VERSION`, and
-`CLOUDAGENT_RUNTIME_GIT_SHA`. Local completion alone is not deployment proof.
+`cloud/hfs/` is the Hugging Face Docker Space source wrapper. It exports a flat,
+safe Space root without product source, then the Docker build fetches
+`https://github.com/BlueSkyXN/CloudAgent-Platform.git` at the emitted full
+commit SHA and verifies detached `HEAD` before launching the real package.
+`CLOUDAGENT_AUTH_TOKEN` is a Space Secret; the SQLite control plane requires an
+existing writable persistent `/data` mount, initializes its application directory
+below that mount, and never falls back to `/tmp`.
+
+The local source-wrapper contract validates only static/exported evidence.
+Docker build, Space deployment and readback, live health/auth smoke, restart
+persistence, backup, and isolated restore verification require a separately
+approved environment. Artifact-lane reclassification remains owner-gated by an
+observed source-build threshold; this repository supplies no such evidence.
 
 `local/20260616/` contains the SDLC, threat model, data model, validation plan,
 roadmap, and deployment records. The implemented API contract is always the

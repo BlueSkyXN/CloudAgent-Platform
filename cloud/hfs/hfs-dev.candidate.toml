@@ -1,6 +1,6 @@
 standard = "2.0"
 project = "cloudagent-platform"
-space = "BlueSkyXN/cloudagent-platform-hfs"
+space = "BlueSkyXN/cloudagent-platform-hfs-v2-candidate"
 sovereignty = "sovereign"
 lane = "source"
 version_source = "commit"
