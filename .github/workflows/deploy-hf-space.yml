@@ -1,0 +1,159 @@
+name: Deploy canonical HFS wrapper
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact 40-character GitHub main commit to deploy
+        required: true
+        type: string
+      confirm_upload:
+        description: Type PUBLISH_FORMAL to authorize the canonical Space write
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudagent-canonical-hfs-wrapper
+  cancel-in-progress: false
+
+env:
+  FORMAL_SPACE: BlueSkyXN/cloudagent-platform-hfs
+  HF_CLI_VERSION: "1.5.0"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: hfs-production
+    steps:
+      - name: Check out exact reviewed main
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Authorize exact main
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          CONFIRM_UPLOAD: ${{ inputs.confirm_upload }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CONFIRM_UPLOAD" == PUBLISH_FORMAL ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_SHA" == "$SOURCE_REF" ]]
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_REF" ]]
+          [[ "$(git rev-parse origin/main)" == "$SOURCE_REF" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+
+      - name: Validate and export formal wrapper
+        run: |
+          python3 cloud/hfs/validate_source_wrapper.py
+          bash cloud/hfs/export_space_bundle.sh "$RUNNER_TEMP/cloudagent-formal-bundle"
+
+      - name: Install pinned Hugging Face client
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - run: |
+          python3 -m pip install --disable-pip-version-check "huggingface_hub==${HF_CLI_VERSION}"
+          python3 -m huggingface_hub.cli.hf version
+          python3 -m huggingface_hub.cli.hf --help >/dev/null
+          python3 -m huggingface_hub.cli.hf upload --help >/dev/null
+
+      - name: Require existing private canonical Space and thin tree
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          test -n "${HF_TOKEN:-}" || { echo "HF_TOKEN environment Secret is required" >&2; exit 2; }
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import HfApi
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          expected = {path.name for path in Path(os.environ["RUNNER_TEMP"], "cloudagent-formal-bundle").iterdir() if path.is_file()}
+          expected.add(".gitattributes")
+          info = api.space_info(os.environ["FORMAL_SPACE"], token=os.environ["HF_TOKEN"])
+          actual = set(api.list_repo_files(os.environ["FORMAL_SPACE"], repo_type="space", token=os.environ["HF_TOKEN"]))
+          if info.private is not True:
+              raise SystemExit("canonical Space must already exist and be private")
+          if actual - expected:
+              raise SystemExit("canonical Space contains a path outside the formal bundle allowlist")
+          PY
+
+      - name: Upload verified formal wrapper
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          python3 -m huggingface_hub.cli.hf upload \
+            "$FORMAL_SPACE" "$RUNNER_TEMP/cloudagent-formal-bundle" . \
+            --repo-type space --revision main \
+            --commit-message "Deploy verified CloudAgent wrapper ${SOURCE_REF}"
+
+      - name: Read back every file and factory restart
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import re
+          import time
+          from pathlib import Path
+          from huggingface_hub import HfApi, hf_hub_download
+
+          token = os.environ["HF_TOKEN"]
+          space = os.environ["FORMAL_SPACE"]
+          bundle = Path(os.environ["RUNNER_TEMP"], "cloudagent-formal-bundle")
+          expected = {path.name for path in bundle.iterdir() if path.is_file()}
+          api = HfApi(token=token)
+          info = api.space_info(space, token=token)
+          if info.private is not True:
+              raise SystemExit("canonical Space must remain private after upload")
+          deployed_revision = info.sha
+          if not isinstance(deployed_revision, str) or re.fullmatch(r"[0-9a-f]{40}", deployed_revision) is None:
+              raise SystemExit("canonical Space did not expose an immutable deployed revision")
+          actual = set(api.list_repo_files(space, revision=deployed_revision, repo_type="space", token=token))
+          if actual != expected | {".gitattributes"}:
+              raise SystemExit("canonical repository path readback does not match the formal allowlist")
+          for name in sorted(expected):
+              downloaded = Path(
+                  hf_hub_download(
+                      space,
+                      filename=name,
+                      revision=deployed_revision,
+                      repo_type="space",
+                      token=token,
+                  )
+              )
+              if hashlib.sha256(downloaded.read_bytes()).digest() != hashlib.sha256((bundle / name).read_bytes()).digest():
+                  raise SystemExit(f"canonical readback mismatch: {name}")
+          provenance = dict(
+              line.split("=", 1)
+              for line in (bundle / "BUILD_SOURCE.txt").read_text(encoding="utf-8").splitlines()
+              if "=" in line
+          )
+          if provenance.get("source_commit") != os.environ["SOURCE_REF"]:
+              raise SystemExit("formal wrapper provenance does not match exact GitHub main input")
+          api.restart_space(space, factory_reboot=True)
+          deadline = time.monotonic() + 1800
+          while True:
+              runtime = api.get_space_runtime(space, token=token)
+              if runtime.stage == "RUNNING" and runtime.raw.get("sha") == deployed_revision:
+                  print(f"canonical runtime readback passed: repo_sha={deployed_revision}")
+                  break
+              if runtime.stage in {"BUILD_ERROR", "RUNTIME_ERROR"}:
+                  raise SystemExit(f"canonical Space failed after deploy: {runtime.stage}")
+              if time.monotonic() >= deadline:
+                  raise SystemExit(
+                      f"canonical runtime did not converge to deployed revision {deployed_revision}: "
+                      f"stage={runtime.stage} runtime_sha={runtime.raw.get('sha')}"
+                  )
+              time.sleep(15)
+          PY
