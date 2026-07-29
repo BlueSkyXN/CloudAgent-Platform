@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate CloudAgent's local HFS v2 source-wrapper contract without network access."""
+"""Validate CloudAgent's local HFS v2.1 source-wrapper contract without network access."""
 
 from __future__ import annotations
 
@@ -66,22 +66,34 @@ def check_registry() -> None:
     manifest = tomllib.loads((HFS_ROOT / "hfs-dev.toml").read_text(encoding="utf-8"))
     candidate = tomllib.loads((HFS_ROOT / "hfs-dev.candidate.toml").read_text(encoding="utf-8"))
     expected = {
-        "standard": "2.0",
+        "standard": "2.1",
         "project": "cloudagent-platform",
+        "space": "BlueSkyXN/cloudagent-platform-hfs",
         "sovereignty": "sovereign",
         "lane": "source",
         "version_source": "commit",
+        "project_class": "preview",
+        "target_role": "primary",
+        "env_file": ".env",
+        "secret_files": [],
     }
     for key, value in expected.items():
         if manifest.get(key) != value:
             fail(f"hfs-dev.toml {key} must be {value!r}")
-    if manifest.get("space") != "BlueSkyXN/cloudagent-platform-hfs":
-        fail("production manifest must use the approved no-date Space id")
-    if candidate.get("space") != "BlueSkyXN/cloudagent-platform-hfs-v2-candidate":
-        fail("candidate manifest must use the fixed private candidate Space id")
+    candidate_expected = {
+        "space": "BlueSkyXN/cloudagent-platform-hfs-v2-candidate",
+        "target_role": "candidate",
+        "env_file": "local/hfs-targets/candidate.env",
+    }
+    for key, value in candidate_expected.items():
+        if candidate.get(key) != value:
+            fail(f"candidate manifest {key} must be {value!r}")
     for key in sorted(set(manifest) | set(candidate)):
-        if key != "space" and manifest.get(key) != candidate.get(key):
-            fail(f"candidate manifest differs from production at {key}")
+        if (
+            key not in {"space", "target_role", "env_file"}
+            and manifest.get(key) != candidate.get(key)
+        ):
+            fail(f"candidate manifest differs from canonical preview at {key}")
     if manifest.get("secrets") != ["CLOUDAGENT_AUTH_TOKEN"]:
         fail("hfs-dev.toml must register only CLOUDAGENT_AUTH_TOKEN as a Space Secret")
     if manifest.get("variables") != []:

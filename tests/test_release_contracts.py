@@ -108,7 +108,11 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
 
     def test_hfs_registry_is_source_lane_and_registers_only_real_setting_names(self) -> None:
         manifest = tomllib.loads((HFS_ROOT / "hfs-dev.toml").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["standard"], "2.0")
+        self.assertEqual(manifest["standard"], "2.1")
+        self.assertEqual(manifest["project_class"], "preview")
+        self.assertEqual(manifest["target_role"], "primary")
+        self.assertEqual(manifest["env_file"], ".env")
+        self.assertEqual(manifest["secret_files"], [])
         self.assertEqual(manifest["lane"], "source")
         self.assertEqual(manifest["version_source"], "commit")
         self.assertEqual(manifest["secrets"], ["CLOUDAGENT_AUTH_TOKEN"])

@@ -1,13 +1,17 @@
-standard = "2.0"
+standard = "2.1"
 project = "cloudagent-platform"
 space = "BlueSkyXN/cloudagent-platform-hfs"
 sovereignty = "sovereign"
 lane = "source"
 version_source = "commit"
+project_class = "preview"
+target_role = "primary"
+env_file = ".env"
+secret_files = []
 
 # Local control-plane credentials; never sent to the Space.
 local_only = ["HF_TOKEN", "GH_TOKEN"]
 
-# Key names only. CLOUDAGENT_AUTH_TOKEN is required at runtime.
+# Key names only. Its value must exist first in the ignored plaintext .env ledger.
 secrets = ["CLOUDAGENT_AUTH_TOKEN"]
 variables = []
