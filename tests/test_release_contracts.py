@@ -112,7 +112,36 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
         self.assertEqual(manifest["lane"], "source")
         self.assertEqual(manifest["version_source"], "commit")
         self.assertEqual(manifest["secrets"], ["CLOUDAGENT_AUTH_TOKEN"])
+        self.assertEqual(manifest["optional_secrets"], [])
         self.assertEqual(manifest["variables"], [])
+
+    def test_hfs_formal_workflow_is_exact_main_private_and_read_back(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/deploy-hf-space.yml").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "FORMAL_SPACE: BlueSkyXN/cloudagent-platform-hfs",
+            "[[ \"$GITHUB_REF\" == refs/heads/main ]]",
+            "[[ \"$(git rev-parse origin/main)\" == \"$SOURCE_REF\" ]]",
+            "canonical Space must already exist and be private",
+            'HF_CLI_CLICK_VERSION: "8.3.3"',
+            'huggingface_hub==${HF_CLI_VERSION}',
+            "click==${HF_CLI_CLICK_VERSION}",
+            "python3 -m huggingface_hub.cli.hf --help",
+            "canonical repository path readback does not match",
+            'runtime.raw.get("sha") == deployed_revision',
+        ):
+            self.assertIn(required, workflow)
+
+    def test_hfs_exporter_declares_and_enforces_a_flat_allowlist(self) -> None:
+        exporter = (HFS_ROOT / "export_space_bundle.sh").read_text(encoding="utf-8")
+        for required in (
+            "expected_export_files=(",
+            "git -C \"${repo_root}\" ls-files --error-unmatch",
+            "export source must be a tracked regular file",
+            "unexpected file in Space export",
+        ):
+            self.assertIn(required, exporter)
 
     def test_hfs_source_wrapper_static_contract(self) -> None:
         result = subprocess.run(

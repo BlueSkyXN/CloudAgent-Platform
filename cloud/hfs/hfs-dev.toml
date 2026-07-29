@@ -10,4 +10,5 @@ local_only = ["HF_TOKEN", "GH_TOKEN"]
 
 # Key names only. CLOUDAGENT_AUTH_TOKEN is required at runtime.
 secrets = ["CLOUDAGENT_AUTH_TOKEN"]
+optional_secrets = []
 variables = []
