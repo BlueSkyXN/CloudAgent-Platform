@@ -22,6 +22,7 @@ concurrency:
 env:
   FORMAL_SPACE: BlueSkyXN/cloudagent-platform-hfs
   HF_CLI_VERSION: "1.5.0"
+  HF_CLI_CLICK_VERSION: "8.3.1"
 
 jobs:
   deploy:
@@ -59,7 +60,9 @@ jobs:
         with:
           python-version: "3.11"
       - run: |
-          python3 -m pip install --disable-pip-version-check "huggingface_hub==${HF_CLI_VERSION}"
+          python3 -m pip install --disable-pip-version-check \
+            "huggingface_hub==${HF_CLI_VERSION}" \
+            "click==${HF_CLI_CLICK_VERSION}"
           python3 -m huggingface_hub.cli.hf version
           python3 -m huggingface_hub.cli.hf --help >/dev/null
           python3 -m huggingface_hub.cli.hf upload --help >/dev/null
