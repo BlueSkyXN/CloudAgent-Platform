@@ -124,7 +124,7 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
             "[[ \"$GITHUB_REF\" == refs/heads/main ]]",
             "[[ \"$(git rev-parse origin/main)\" == \"$SOURCE_REF\" ]]",
             "canonical Space must already exist and be private",
-            'HF_CLI_CLICK_VERSION: "8.3.1"',
+            'HF_CLI_CLICK_VERSION: "8.3.3"',
             'huggingface_hub==${HF_CLI_VERSION}',
             "click==${HF_CLI_CLICK_VERSION}",
             "python3 -m huggingface_hub.cli.hf --help",

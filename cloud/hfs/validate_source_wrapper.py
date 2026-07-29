@@ -236,7 +236,7 @@ def check_formal_workflow() -> None:
         "PUBLISH_FORMAL",
         "validate_source_wrapper.py",
         "canonical repository path readback does not match",
-        'HF_CLI_CLICK_VERSION: "8.3.1"',
+        'HF_CLI_CLICK_VERSION: "8.3.3"',
         "huggingface_hub==${HF_CLI_VERSION}",
         "click==${HF_CLI_CLICK_VERSION}",
         "python3 -m huggingface_hub.cli.hf --help",

@@ -22,7 +22,7 @@ concurrency:
 env:
   FORMAL_SPACE: BlueSkyXN/cloudagent-platform-hfs
   HF_CLI_VERSION: "1.5.0"
-  HF_CLI_CLICK_VERSION: "8.3.1"
+  HF_CLI_CLICK_VERSION: "8.3.3"
 
 jobs:
   deploy:
