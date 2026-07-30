@@ -1,9 +1,15 @@
-standard = "2.0"
+standard = "2.1"
 project = "cloudagent-platform"
 space = "BlueSkyXN/cloudagent-platform-hfs-v2-candidate"
 sovereignty = "sovereign"
 lane = "source"
 version_source = "commit"
+project_class = "preview"
+target_role = "candidate"
+space_visibility = "protected"
+bucket_visibility = "private"
+env_file = "local/hfs-targets/candidate.env"
+secret_files = []
 
 # Local control-plane credentials; never sent to the Space.
 local_only = ["HF_TOKEN", "GH_TOKEN"]

@@ -21,8 +21,8 @@ concurrency:
 
 env:
   FORMAL_SPACE: BlueSkyXN/cloudagent-platform-hfs
-  HF_CLI_VERSION: "1.5.0"
-  HF_CLI_CLICK_VERSION: "8.3.3"
+  HF_CLI_VERSION: "1.25.1"
+  HF_CLI_CLICK_VERSION: "8.4.2"
 
 jobs:
   deploy:
@@ -65,6 +65,7 @@ jobs:
             "click==${HF_CLI_CLICK_VERSION}"
           python3 -m huggingface_hub.cli.hf version
           python3 -m huggingface_hub.cli.hf --help >/dev/null
+          python3 -m huggingface_hub.cli.hf repos settings --help | grep -- --protected
           python3 -m huggingface_hub.cli.hf upload --help >/dev/null
 
       - name: Require existing private canonical Space and thin tree

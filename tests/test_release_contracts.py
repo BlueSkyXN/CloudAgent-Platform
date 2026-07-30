@@ -108,7 +108,13 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
 
     def test_hfs_registry_is_source_lane_and_registers_only_real_setting_names(self) -> None:
         manifest = tomllib.loads((HFS_ROOT / "hfs-dev.toml").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["standard"], "2.0")
+        self.assertEqual(manifest["standard"], "2.1")
+        self.assertEqual(manifest["project_class"], "preview")
+        self.assertEqual(manifest["target_role"], "primary")
+        self.assertEqual(manifest["space_visibility"], "protected")
+        self.assertEqual(manifest["bucket_visibility"], "private")
+        self.assertEqual(manifest["env_file"], ".env")
+        self.assertEqual(manifest["secret_files"], [])
         self.assertEqual(manifest["lane"], "source")
         self.assertEqual(manifest["version_source"], "commit")
         self.assertEqual(manifest["secrets"], ["CLOUDAGENT_AUTH_TOKEN"])
@@ -124,10 +130,12 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
             "[[ \"$GITHUB_REF\" == refs/heads/main ]]",
             "[[ \"$(git rev-parse origin/main)\" == \"$SOURCE_REF\" ]]",
             "canonical Space must already exist and be private",
-            'HF_CLI_CLICK_VERSION: "8.3.3"',
+            'HF_CLI_VERSION: "1.25.1"',
+            'HF_CLI_CLICK_VERSION: "8.4.2"',
             'huggingface_hub==${HF_CLI_VERSION}',
             "click==${HF_CLI_CLICK_VERSION}",
             "python3 -m huggingface_hub.cli.hf --help",
+            "python3 -m huggingface_hub.cli.hf repos settings --help | grep -- --protected",
             "canonical repository path readback does not match",
             'runtime.raw.get("sha") == deployed_revision',
         ):
