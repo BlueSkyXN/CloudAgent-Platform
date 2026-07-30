@@ -44,6 +44,42 @@ if [[ -n "$(git -C "${repo_root}" status --porcelain)" ]]; then
   exit 65
 fi
 
+source_files=(
+  README.md
+  Dockerfile
+  .dockerignore
+  start.sh
+  healthcheck.sh
+  validate_persistent_path.py
+)
+expected_payload_files=(
+  .dockerignore
+  .gitignore
+  BUILD_SOURCE.txt
+  Dockerfile
+  README.md
+  healthcheck.sh
+  hfs-dev.toml
+  start.sh
+  validate_persistent_path.py
+)
+expected_export_files=(
+  "${expected_payload_files[@]}"
+  BUNDLE_MANIFEST.json
+)
+
+for name in "${source_files[@]}" "${manifest_name}"; do
+  relative="cloud/hfs/${name}"
+  if ! git -C "${repo_root}" ls-files --error-unmatch -- "${relative}" >/dev/null 2>&1; then
+    printf 'export source must be a tracked regular file: %s\n' "${relative}" >&2
+    exit 66
+  fi
+  if [[ ! -f "${hfs_dir}/${name}" || -L "${hfs_dir}/${name}" ]]; then
+    printf 'export source must be a tracked regular file: %s\n' "${relative}" >&2
+    exit 66
+  fi
+done
+
 python3 - "${out_dir}" "${repo_root}" "${hfs_dir}" <<'PY'
 from pathlib import Path
 import sys
@@ -79,7 +115,7 @@ trap cleanup EXIT
 
 copy_file() {
   local name="$1"
-  cp "${hfs_dir}/${name}" "${bundle_dir}/${name}"
+  cp -- "${hfs_dir}/${name}" "${bundle_dir}/${name}"
 }
 
 copy_file README.md
@@ -87,7 +123,7 @@ copy_file Dockerfile
 copy_file .dockerignore
 copy_file start.sh
 copy_file healthcheck.sh
-cp "${manifest_path}" "${bundle_dir}/hfs-dev.toml"
+cp -- "${manifest_path}" "${bundle_dir}/hfs-dev.toml"
 copy_file validate_persistent_path.py
 
 python3 - "${bundle_dir}/Dockerfile" "${source_commit}" <<'PY'
@@ -139,7 +175,7 @@ __pycache__/
 *.log
 EOF
 
-python3 - "${bundle_dir}" "${source_commit}" <<'PY'
+python3 - "${bundle_dir}" "${source_commit}" "${expected_payload_files[@]}" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -150,18 +186,27 @@ from pathlib import Path
 
 out_dir = Path(sys.argv[1])
 source_commit = sys.argv[2]
+expected = set(sys.argv[3:])
 files = []
+actual = set()
 for path in sorted(out_dir.rglob("*")):
+    relative = path.relative_to(out_dir)
     if path.is_symlink():
-        raise SystemExit(f"Space export must not contain symlinks: {path.relative_to(out_dir)}")
-    if not path.is_file() or path.name == "BUNDLE_MANIFEST.json":
-        continue
+        raise SystemExit(f"Space export must not contain symlinks: {relative}")
+    if not path.is_file() or path.parent != out_dir:
+        raise SystemExit(f"unexpected file in Space export: {relative}")
+    actual.add(relative.as_posix())
     files.append(
         {
-            "path": path.relative_to(out_dir).as_posix(),
+            "path": relative.as_posix(),
             "bytes": path.stat().st_size,
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
+    )
+if actual != expected:
+    raise SystemExit(
+        f"unexpected file in Space export: missing={sorted(expected - actual)!r} "
+        f"extra={sorted(actual - expected)!r}"
     )
 
 manifest = {
@@ -179,6 +224,25 @@ out_dir.joinpath("BUNDLE_MANIFEST.json").write_text(
     json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
+PY
+
+python3 - "${bundle_dir}" "${expected_export_files[@]}" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+expected = set(sys.argv[2:])
+actual = set()
+for path in root.rglob("*"):
+    relative = path.relative_to(root)
+    if path.is_symlink() or not path.is_file() or path.parent != root:
+        raise SystemExit(f"unexpected file in Space export: {relative}")
+    actual.add(relative.as_posix())
+if actual != expected:
+    raise SystemExit(
+        f"unexpected file in Space export: missing={sorted(expected - actual)!r} "
+        f"extra={sorted(actual - expected)!r}"
+    )
 PY
 
 for forbidden in .git .env .env.local local data logs dist node_modules src app.py; do

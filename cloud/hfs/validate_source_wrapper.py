@@ -96,6 +96,8 @@ def check_registry() -> None:
             fail(f"candidate manifest differs from canonical preview at {key}")
     if manifest.get("secrets") != ["CLOUDAGENT_AUTH_TOKEN"]:
         fail("hfs-dev.toml must register only CLOUDAGENT_AUTH_TOKEN as a Space Secret")
+    if manifest.get("optional_secrets") != []:
+        fail("hfs-dev.toml optional_secrets must be present and empty")
     if manifest.get("variables") != []:
         fail("hfs-dev.toml must not invent Space Variables for source provenance")
 
@@ -235,12 +237,34 @@ def check_export() -> None:
             fail("candidate export provenance does not match the wrapper commit")
 
 
+def check_formal_workflow() -> None:
+    path = REPO_ROOT / ".github/workflows/deploy-hf-space.yml"
+    if not path.is_file():
+        fail("canonical formal deployment workflow is missing")
+    source = path.read_text(encoding="utf-8")
+    for required in (
+        "FORMAL_SPACE: BlueSkyXN/cloudagent-platform-hfs",
+        "environment: hfs-production",
+        "PUBLISH_FORMAL",
+        "validate_source_wrapper.py",
+        "canonical repository path readback does not match",
+        'HF_CLI_CLICK_VERSION: "8.3.3"',
+        "huggingface_hub==${HF_CLI_VERSION}",
+        "click==${HF_CLI_CLICK_VERSION}",
+        "python3 -m huggingface_hub.cli.hf --help",
+        'runtime.raw.get("sha") == deployed_revision',
+    ):
+        if required not in source:
+            fail(f"formal deployment workflow is missing guard: {required}")
+
+
 def main() -> int:
     argparse.ArgumentParser(description=__doc__).parse_args()
     try:
         check_registry()
         check_source_files()
         check_export()
+        check_formal_workflow()
     except (AssertionError, OSError, subprocess.CalledProcessError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         print(f"HFS source-wrapper contract failed: {exc}", file=sys.stderr)
         return 1
