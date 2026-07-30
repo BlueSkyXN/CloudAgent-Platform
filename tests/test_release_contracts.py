@@ -111,6 +111,8 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
         self.assertEqual(manifest["standard"], "2.1")
         self.assertEqual(manifest["project_class"], "preview")
         self.assertEqual(manifest["target_role"], "primary")
+        self.assertEqual(manifest["space_visibility"], "protected")
+        self.assertEqual(manifest["bucket_visibility"], "private")
         self.assertEqual(manifest["env_file"], ".env")
         self.assertEqual(manifest["secret_files"], [])
         self.assertEqual(manifest["lane"], "source")
@@ -128,10 +130,12 @@ class OpenAPIReleaseContractTests(unittest.TestCase):
             "[[ \"$GITHUB_REF\" == refs/heads/main ]]",
             "[[ \"$(git rev-parse origin/main)\" == \"$SOURCE_REF\" ]]",
             "canonical Space must already exist and be private",
-            'HF_CLI_CLICK_VERSION: "8.3.3"',
+            'HF_CLI_VERSION: "1.25.1"',
+            'HF_CLI_CLICK_VERSION: "8.4.2"',
             'huggingface_hub==${HF_CLI_VERSION}',
             "click==${HF_CLI_CLICK_VERSION}",
             "python3 -m huggingface_hub.cli.hf --help",
+            "python3 -m huggingface_hub.cli.hf repos settings --help | grep -- --protected",
             "canonical repository path readback does not match",
             'runtime.raw.get("sha") == deployed_revision',
         ):

@@ -74,6 +74,8 @@ def check_registry() -> None:
         "version_source": "commit",
         "project_class": "preview",
         "target_role": "primary",
+        "space_visibility": "protected",
+        "bucket_visibility": "private",
         "env_file": ".env",
         "secret_files": [],
     }
@@ -248,10 +250,12 @@ def check_formal_workflow() -> None:
         "PUBLISH_FORMAL",
         "validate_source_wrapper.py",
         "canonical repository path readback does not match",
-        'HF_CLI_CLICK_VERSION: "8.3.3"',
+        'HF_CLI_VERSION: "1.25.1"',
+        'HF_CLI_CLICK_VERSION: "8.4.2"',
         "huggingface_hub==${HF_CLI_VERSION}",
         "click==${HF_CLI_CLICK_VERSION}",
         "python3 -m huggingface_hub.cli.hf --help",
+        "python3 -m huggingface_hub.cli.hf repos settings --help | grep -- --protected",
         'runtime.raw.get("sha") == deployed_revision',
     ):
         if required not in source:
