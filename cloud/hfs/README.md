@@ -20,7 +20,8 @@ Space root.
 
 - Lane: `source`; version source: full 40-character Git commit SHA.
 - `hfs-dev.toml` uses HFS `2.1` with `project_class = "preview"`,
-  `target_role = "primary"`, and the canonical Space
+  `target_role = "primary"`, `space_visibility = "protected"`,
+  `bucket_visibility = "private"`, and the canonical Space
   `BlueSkyXN/cloudagent-platform-hfs`.
 - The exported `Dockerfile`, `BUILD_SOURCE.txt`, and `BUNDLE_MANIFEST.json` bind
   the same `source_commit` from
